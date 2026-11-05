@@ -1,0 +1,3 @@
+# 运行与打包所需依赖（Windows 10/11, Python 3.13）
+PySide6==6.12.0
+pyinstaller==6.22.3

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="_图层_1" xmlns="http://www.w3.org/2000/svg" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 256 256">
+  <!-- Generator: Adobe Illustrator 30.0.0, SVG Export Plug-In . SVG Version: 2.1.1 Build 123)  -->
+  <defs>
+    <style>
+      .st0 {
+        fill: url(#_未命名的渐变_3);
+      }
+
+      .st1 {
+        fill: url(#_未命名的渐变);
+      }
+
+      .st2 {
+        fill: #295260;
+      }
+
+      .st3 {
+        fill: url(#_未命名的渐变_2);
+      }
+    </style>
+    <linearGradient id="_未命名的渐变" data-name="未命名的渐变" x1="28.55" y1="248.4" x2="227.45" y2="11.6" gradientTransform="translate(0 258) scale(1 -1)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e61311"/>
+      <stop offset="1" stop-color="#0055a7"/>
+    </linearGradient>
+    <linearGradient id="_未命名的渐变_2" data-name="未命名的渐变 2" x1="93.23" y1="216.4" x2="161.08" y2="135.63" gradientTransform="translate(0 258) scale(1 -1)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fdfefe"/>
+      <stop offset="1" stop-color="#52a1c5"/>
+    </linearGradient>
+    <linearGradient id="_未命名的渐变_3" data-name="未命名的渐变 3" x1="91.14" y1="121.88" x2="164.86" y2="34.12" gradientTransform="translate(0 258) scale(1 -1)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fdfefe"/>
+      <stop offset="1" stop-color="#52a1c5"/>
+    </linearGradient>
+  </defs>
+  <rect class="st1" x="2" y="2" width="252" height="252" rx="56" ry="56"/>
+  <g>
+    <path class="st3" d="M111.74,26.05h32.52v45.94h35.74c6.08,0,10.98,4.98,10.95,11.06,0,2.81-1.1,5.51-3.05,7.55l-50,51c-4.65,5.47-12.86,6.13-18.33,1.47-.53-.45-1.02-.94-1.47-1.47l-50-51c-4.2-4.39-4.04-11.35.35-15.55,2.03-1.94,4.73-3.05,7.55-3.05h35.87l-.13-45.94h0Z"/>
+    <path class="st0" d="M70,160h116c11.05,0,20,8.95,20,20h0c0,11.05-8.95,20-20,20h-116c-11.05,0-20-8.95-20-20h0c0-11.05,8.95-20,20-20Z"/>
+  </g>
+  <path class="st2" d="M69.4,175.65h25.21c2.4,0,4.35,1.95,4.35,4.35h0c0,2.4-1.95,4.35-4.35,4.35h-25.21c-2.4,0-4.35-1.95-4.35-4.35h0c0-2.4,1.95-4.35,4.35-4.35Z"/>
+  <path class="st2" d="M115.39,175.65h25.21c2.4,0,4.35,1.95,4.35,4.35h0c0,2.4-1.95,4.35-4.35,4.35h-25.21c-2.4,0-4.35-1.95-4.35-4.35h0c0-2.4,1.95-4.35,4.35-4.35Z"/>
+  <path class="st2" d="M161.39,175.65h25.21c2.4,0,4.35,1.95,4.35,4.35h0c0,2.4-1.95,4.35-4.35,4.35h-25.21c-2.4,0-4.35-1.95-4.35-4.35h0c0-2.4,1.95-4.35,4.35-4.35h0Z"/>
+</svg>

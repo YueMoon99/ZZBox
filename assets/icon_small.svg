@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>舟舟视频工具箱（16-24px 简化版：去掉条带上的三个孔，加粗笔画）</title>
+  <defs>
+    <linearGradient id="bg" x1="0.08" y1="0.02" x2="0.92" y2="0.98">
+      <stop offset="0" stop-color="#E61311"/>
+      <stop offset="1" stop-color="#0055A7"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D6E8F4"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="252" height="252" rx="56" fill="url(#bg)"/>
+  <g fill="url(#ink)">
+    <path d="M105 24 h46 v47 h35 a11.5 11.5 0 0 1 8 19.6 l-51 51 a13 13 0 0 1 -18.4 0
+             l-51 -51 A11.5 11.5 0 0 1 82 71 h34 Z"/>
+    <rect x="48" y="158" width="160" height="44" rx="22"/>
+  </g>
+</svg>
