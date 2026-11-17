@@ -40,18 +40,9 @@ PDF 一格一页地重排、合并、拆页，压缩只换图片不动文字。
 
 ## 下载
 
-到 [Releases](../../releases) 页面下载。自己出包就跑 `python tools/make_zips.py`，产物就是下面这两个：
-
-| 包 | 说明 | 大小 |
-|---|---|---|
-| `ZZBox-v0.7.0-win64-full.zip` | **推荐**，内置 FFmpeg 与 AI 引擎，解压即用 | 约 150 MB |
-| `ZZBox-v0.7.0-win64-lite.zip` | 不含 FFmpeg，需自己把 `ffmpeg.exe` / `ffprobe.exe` 放进 `bin\`（没放会提示「未找到 FFmpeg」，程序照常打开） | 约 90 MB |
+到 [Releases](../../releases) 页面下载。自己出包就跑 `python tools/make_zips.py`。
 
 解压后双击 `ZZBox.exe`。整个文件夹可以拷到 U 盘或别的电脑直接用，不写注册表。
-
-> **为什么分两个包**：内置的 FFmpeg 是 GPLv3 授权的独立程序，和主程序属于两个独立作品（通过命令行
-> 进程调用，不链接）。自己用下 full 包最省事；要二次分发或商用，下 lite 包自己准备 FFmpeg 更省心。
-> 详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 ---
 
@@ -345,10 +336,6 @@ PDF 工作台的队列换了形态：**一格是一页，不是一个文件**。
 **双击 `启动.bat` 提示找不到 ZZBox.exe？**
 先确认 `ZZBox.exe` 和 `启动.bat` 在同一个文件夹里。这个脚本先在当前目录找，找不到才去翻
 `ZZBox vX.Y.Z` 这样的子文件夹（老版本包的布局）。实在不行直接双击 `ZZBox.exe`。
-
-**提示「未找到 ffmpeg.exe」？**
-你下的是 lite 包。把 `ffmpeg.exe` 和 `ffprobe.exe` 放进程序目录下的 `bin\`，或者确保它们在 PATH 里。
-不放也能打开程序，只是视频和图片功能会提示缺依赖。
 
 **PDF 压缩后体积几乎没变？**
 说明这一份没什么可压的：纯文字页没有图片，页面上图片本来就只有几十 KB，或者图片全被跳过规则挡住了。

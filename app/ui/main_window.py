@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,7 +77,7 @@ from app.core.image import (
     warnings_for,
 )
 from app.core.image_runner import ImageRunner
-from app.core.media import MediaInfo, probe_media
+from app.core.media import MediaInfo, human_size, probe_media
 from app.core.pdf import (
     PageRef,
     PdfError,
@@ -2238,8 +2239,11 @@ class MainWindow(QMainWindow):
             st.tip = (info.error if info else "") or "读取失败"
         else:
             st.tip = ""
-        self._img_paint_row(key)
-        self._refresh_img()
+        try:
+            self._img_paint_row(key)
+            self._refresh_img()
+        except Exception as exc:  # noqa: BLE001
+            self._report_meta_crash(key, exc, img=True)
 
     def _img_refresh_count(self) -> None:
         n = len(self.img_files)
@@ -2637,9 +2641,35 @@ class MainWindow(QMainWindow):
             st.tip = (info.error if info else "") or "读取失败"
         else:
             st.tip = ""
-        self._paint_row(key)
-        self._refresh_scale_preview()
-        self._refresh_ai()
+        try:
+            self._paint_row(key)
+            self._refresh_scale_preview()
+            self._refresh_ai()
+        except Exception as exc:  # noqa: BLE001
+            self._report_meta_crash(key, exc, img=False)
+
+    def _report_meta_crash(self, key: Path, exc: Exception, *, img: bool) -> None:
+        """元信息回调里出的错，不能只在 stderr 留一行。
+
+        槽函数抛异常会被 Qt 直接吞掉：traceback 打到控制台（打包版根本没有
+        控制台），而这一行永远停在「读取中…」—— 用户看到的是转圈不动，
+        既不知道出了错，也没法重试。这里兜住，把行标成失败并把原因写进
+        提示里，至少是可解释、可重试的。
+        """
+        traceback.print_exc()
+        st = self._img_state(key) if img else self._state(key)
+        st.phase = "failed"
+        st.status = "读取失败"
+        st.tip = f"界面渲染出错：{exc}"
+        rows = self.img_rows if img else self.rows
+        idx = self._img_index_of(key) if img else self._row_index(key)
+        if 0 <= idx < len(rows):
+            try:
+                rows[idx].items[1].setText("读取失败")
+                for it in rows[idx].items[:5]:
+                    it.setToolTip(st.tip)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _refresh_count(self) -> None:
         n = len(self.files)
