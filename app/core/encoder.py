@@ -178,6 +178,12 @@ def build_command(
     # ---- 视频编码 ----
     cmd += ["-c:v", enc, "-preset", "p6", "-tune", "hq"]
 
+    if media.is_rgb:
+        # 源本身是 RGB 编码（gbrp / rgb24）时，不指定就会原样继承：NVENC 会编出
+        # HEVC Rext + gbrp，绝大多数播放器按 YUV 解释，画面直接绿配品红。
+        # 只在源为 RGB 时兜底，避免改变 10bit 素材现有的位深行为。
+        cmd += ["-pix_fmt", "yuv420p"]
+
     if s.mode == "bitrate":
         kbps = max(100, int(s.bitrate_kbps))
         cmd += [

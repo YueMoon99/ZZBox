@@ -34,6 +34,7 @@ QWidget {{
 QLabel#title {{ font-size: 13px; font-weight: 500; }}
 QLabel#version {{ font-size: 11px; color: {DIM}; }}
 QLabel#hint {{ font-size: 11px; color: {DIM}; }}
+QLabel#alert {{ font-size: 11px; color: {WARN_COLOR}; }}
 QLabel#sectionTitle {{ font-size: 12px; color: {MUTED}; }}
 
 QFrame#card {{
@@ -41,6 +42,36 @@ QFrame#card {{
     border: 1px solid {BORDER};
     border-radius: 10px;
 }}
+/* 集成化参数面板：一张扁卡片装满所有参数，替代 2×2 的四张 Card */
+QFrame#optpanel {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+}}
+QLabel#optlabel {{ font-size: 11px; color: {MUTED}; }}
+
+/* 顶部「视频处理 / 图片处理」大分段：整条是一个面，选中的那块浮起来 */
+QFrame#modebar {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+}}
+QPushButton#mode {{
+    border: none;
+    border-radius: 7px;
+    padding: 5px 18px;
+    color: {MUTED};
+    font-size: 12px;
+    background: transparent;
+}}
+QPushButton#mode:hover {{ color: {TEXT}; background: #2c2c33; }}
+QPushButton#mode:checked {{
+    background: {ACCENT};
+    color: {ACCENT_TEXT};
+    font-weight: 500;
+}}
+QPushButton#mode:checked:hover {{ background: {ACCENT_HOVER}; }}
+QPushButton#mode:disabled {{ color: #55555c; }}
 QFrame#queue {{
     background: {QUEUE_BG};
     border: 1px solid {BORDER_STRONG};
@@ -173,6 +204,30 @@ QHeaderView::section:hover {{ color: #cfcfd6; }}
 QTableCornerButton::section {{ background: {HEADER}; border: none; }}
 QLabel#emptyHint {{ color: {DIM}; font-size: 12px; }}
 
+/* PDF 页面格墙。和表格不一样，这里是「一格一页」，选中态靠底色 + 描边，
+   默认态给一圈透明边框，选中时才换成强调色 —— 否则加边框会把格子挤动 1px，
+   整面墙跟着抖一下 */
+QListWidget#pageGrid {{
+    background: transparent;
+    border: none;
+    outline: none;
+    color: {MUTED};
+}}
+QListWidget#pageGrid::item {{
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 4px 2px 2px 2px;
+    font-size: 11px;
+    color: {DIM};
+}}
+QListWidget#pageGrid::item:hover {{ background: #27272d; color: {MUTED}; }}
+QListWidget#pageGrid::item:selected {{
+    background: {ROW_SEL};
+    border: 1px solid {ACCENT};
+    color: {TEXT};
+}}
+QLabel#dlgTitle {{ font-size: 14px; font-weight: 500; }}
+
 QProgressBar {{
     background: {TRACK};
     border: none;
@@ -224,6 +279,39 @@ QMenu::separator {{
     height: 1px;
     background: {BORDER};
     margin: 5px 8px;
+}}
+
+/* ---- 属性页页签：仿 Windows 属性对话框 ----
+   未选中的页签是一块比背景稍亮的底 + 三面细边；选中的页签底色换成与内容区
+   相同的 BG，让人眼把它和下面那块内容读成同一个面。底部那根线由
+   _TabStrip.paintEvent 画（并在活动页签处断开），所以这里一律不给
+   border-bottom，否则会出现第二条线。 */
+QPushButton#ptab {{
+    background: {HEADER};
+    border-top: 1px solid #2a2a30;
+    border-left: 1px solid #2a2a30;
+    border-right: 1px solid #2a2a30;
+    border-bottom: none;
+    border-radius: 0px;
+    padding: 0px;
+    color: {MUTED};
+    font-size: 12px;
+}}
+QPushButton#ptab:hover {{ color: {TEXT}; background: #26262b; }}
+QPushButton#ptab:checked {{
+    background: {BG};
+    border-top: 1px solid {BORDER_STRONG};
+    border-left: 1px solid {BORDER_STRONG};
+    border-right: 1px solid {BORDER_STRONG};
+    border-bottom: none;
+    color: {TEXT};
+}}
+QStackedWidget#ptabpane {{
+    background: {BG};
+    border-top: none;
+    border-left: 1px solid {BORDER_STRONG};
+    border-right: 1px solid {BORDER_STRONG};
+    border-bottom: 1px solid {BORDER_STRONG};
 }}
 """
 

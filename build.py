@@ -15,7 +15,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "ZZBox"
 STAGE = ROOT / "_stage"
-DIST = ROOT / "ZZBox v0.6.1"
+# 输出目录。默认放到仓库上一级（D:\...\gpu-video-encoder\zz box 0.7.0），
+# 也可以命令行覆盖：python build.py "D:\some\where\ZZBox"
+DIST = Path(
+    (sys.argv[1] if len(sys.argv) > 1 else "")
+    or os.environ.get("ZZBOX_DIST")
+    or (ROOT.parents[1] / "zz box 0.7.0")
+)
 BUILD = ROOT / "build"
 ICON = ROOT / "assets" / "icon.ico"
 ASSETS = ROOT / "assets"
@@ -120,8 +126,13 @@ def main() -> int:
         cmd += ["--version-file", str(ver)]
     # 运行时用的多尺寸 PNG，打进 _internal/assets，托盘和 Alt-Tab 才不会发虚
     cmd += ["--add-data", f"{ASSETS}{os.pathsep}assets"]
+    # pypdfium2 的 pdfium.dll 是数据文件而不是扩展模块，PyInstaller 的
+    # import 分析看不见它。不显式收集的话，源码跑得好好的，打包后
+    # 一点 PDF 就报 "cannot load library pdfium.dll"
+    cmd += ["--collect-binaries", "pypdfium2"]
     cmd.append(str(ROOT / "main.py"))
 
+    print(f"输出目录：{DIST}")
     print("构建中…（首次约 1-3 分钟）")
     proc = subprocess.run(cmd, cwd=str(ROOT))
     if proc.returncode != 0:
@@ -130,24 +141,32 @@ def main() -> int:
 
     built = staging  # staging 已是 distpath/APP_NAME，不能再套一层
 
-    # FFmpeg / ffprobe 放到 exe 同级 bin 目录，probe.app_root() 会据此找到
+    # 整个 bin/ 搬过去：FFmpeg 由 probe.app_root() 找到，AI 引擎由 ai.ai_dir() 找到。
+    # 逐个文件复制的话，以后往 bin/ 里加东西就得记得回来改这里。
     src_bin = ROOT / "bin"
     dst_bin = built / "bin"
-    dst_bin.mkdir(parents=True, exist_ok=True)
-    for name in ("ffmpeg.exe", "ffprobe.exe"):
-        src = src_bin / name
-        if src.exists():
-            shutil.copy2(src, dst_bin / name)
-            print(f"  已附带 {name} ({src.stat().st_size / 1048576:.0f} MB)")
-        else:
-            print(f"  [警告] 缺少 {src}")
+    if src_bin.is_dir():
+        shutil.copytree(src_bin, dst_bin, dirs_exist_ok=True)
+        for name in ("ffmpeg.exe", "ffprobe.exe"):
+            if not (dst_bin / name).exists():
+                print(f"  [警告] 缺少 bin/{name}")
+        ai_dir = dst_bin / "ai"
+        ai_mb = (
+            sum(f.stat().st_size for f in ai_dir.rglob("*") if f.is_file()) / 1048576
+            if ai_dir.is_dir()
+            else 0
+        )
+        n_files = sum(1 for f in dst_bin.rglob("*") if f.is_file())
+        print(f"  bin/ 已附带 {n_files} 个文件（其中 AI 引擎 {ai_mb:.0f} MB）")
+        if not ai_mb:
+            print("  [提示] 没有 AI 引擎，包内「AI 增强」页会提示缺失（普通压制不受影响）")
 
     readme = ROOT / "README.txt"
     if readme.exists():
         shutil.copy2(readme, built / readme.name)
 
     # 许可证与第三方声明：分发 GPL 的 ffmpeg 二进制时必须随包附带
-    for extra in ("LICENSE", "THIRD-PARTY-NOTICES.md"):
+    for extra in ("LICENSE", "THIRD-PARTY-NOTICES.md", "启动.bat"):
         src = ROOT / extra
         if src.exists():
             shutil.copy2(src, built / src.name)
@@ -160,6 +179,7 @@ def main() -> int:
                 shutil.copy2(f, dst_lic / f.name)
 
     # 旧版本改名挪走（不删除），新版本就位
+    DIST.parent.mkdir(parents=True, exist_ok=True)
     if DIST.exists():
         _park(DIST)
     shutil.copytree(built, DIST)

@@ -9,7 +9,7 @@ ZZBox 自身的源码以 [MIT](LICENSE) 授权。下面这些组件是**独立�
 | 项目 | 内容 |
 |---|---|
 | 程序 | `ffmpeg.exe`、`ffprobe.exe` |
-| 版本 | `9.0.2-essentials_build` |
+| 版本 | `7.1-essentials_build`（以随包 `ffmpeg.exe -version` 的实际输出为准） |
 | 来源 | [gyan.dev/ffmpeg/builds](https://www.gyan.dev/ffmpeg/builds/) |
 | 上游 | [ffmpeg.org](https://ffmpeg.org/) |
 | 许可证 | **GNU General Public License v3**（全文见 [licenses/GPL-3.0.txt](licenses/GPL-3.0.txt)） |
@@ -46,7 +46,9 @@ ZZBox 通过 **子进程调用命令行** 使用 FFmpeg（`subprocess` 执行 `f
 4. **如果你改过 FFmpeg 源码** —— 需要公开你的修改（本项目没有修改）
 
 **对应的源码获取地址**（第三方构建，源码同页提供）：
-<https://www.gyan.dev/ffmpeg/builds/>（`ffmpeg-9.0.2-essentials_build` 对应的 source 包）
+<https://www.gyan.dev/ffmpeg/builds/>（`ffmpeg-7.1-essentials_build` 对应的 source 包）
+
+> 升级 FFmpeg 时请同步修改本节与 README 里的版本号 —— 这份文件是履行 GPLv3 告知义务的载体，写成旧版本等于没告知。
 
 **上游源码**：<https://ffmpeg.org/download.html> · 镜像 <https://git.ffmpeg.org/ffmpeg.git>
 
@@ -56,7 +58,74 @@ ZZBox 通过 **子进程调用命令行** 使用 FFmpeg（`subprocess` 执行 `f
 
 ---
 
-## 2. Qt for Python（PySide6）— LGPLv3
+## 2. AI 增强引擎（Real-ESRGAN / RIFE / ncnn）
+
+`bin/ai/` 下的两个可执行程序同样是**独立作品**，和 FFmpeg 一样通过子进程命令行调用，不与主程序链接。
+
+### 2.1 Real-ESRGAN（BSD-3-Clause）
+
+| 项目 | 内容 |
+|---|---|
+| 程序 | `bin/ai/esrgan/realesrgan-ncnn-vulkan.exe` 及其 `models/` 权重 |
+| 上游 | [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) |
+| 许可证 | **BSD 3-Clause**（全文见 [licenses/Real-ESRGAN-BSD-3-Clause.txt](licenses/Real-ESRGAN-BSD-3-Clause.txt)） |
+| 商用 | 允许，保留版权声明与免责声明即可 |
+
+用到的权重：`realesr-animevideov3`（x2/x3/x4）与 `realesrgan-x4plus`，由上游以同一许可证发布。
+
+### 2.2 RIFE / rife-ncnn-vulkan（MIT）
+
+| 项目 | 内容 |
+|---|---|
+| 程序 | `bin/ai/rife/rife-ncnn-vulkan.exe` 及 `rife-v4.6/` 权重 |
+| 算法 | [hzwer/ECCV2022-RIFE](https://github.com/hzwer/ECCV2022-RIFE)（MIT） |
+| ncnn 实现 | [nihui/rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan)（MIT，全文见 [licenses/rife-ncnn-vulkan-LICENSE.txt](licenses/rife-ncnn-vulkan-LICENSE.txt)） |
+| 商用 | 允许，保留版权声明即可 |
+
+### 2.3 ncnn（BSD-3-Clause）
+
+两个引擎的推理框架，[Tencent/ncnn](https://github.com/Tencent/ncnn)，BSD-3-Clause。它已被静态编译进上述两个 exe，因此这两个二进制里同时含有 ncnn 的代码。
+
+### 2.4 Vulkan 与 vcomp140.dll
+
+- **Vulkan**：没有随包分发任何 Vulkan 运行时，运行时用的是**显卡驱动自带**的 `vulkan-1.dll`。所以 AI 增强要求安装了较新的显卡驱动。
+- **vcomp140.dll**：Microsoft Visual C++ 运行库（OpenMP），随引擎二进制附带。分发它适用 Visual Studio 的可再发行组件许可，允许随应用程序一起分发。
+
+---
+
+## 3. PDF 处理库（pypdfium2 / PDFium / pypdf / Pillow）
+
+PDF 工作台用的是**链接进主程序**的库（不像 FFmpeg 那样子进程调用），所以许可证选择和本项目是否兼容就是硬要求。
+
+| 组件 | 版本 | 许可证 | 用途 |
+|---|---|---|---|
+| [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) | 5.15.2 | Apache-2.0 / BSD-3-Clause | PDF 页面搬运、渲染、封装 |
+| [PDFium](https://pdfium.googlesource.com/pdfium/) | 随 pypdfium2 分发 | BSD-3-Clause | pypdfium2 底层的 PDF 引擎（Google/Chromium 项目） |
+| [pypdf](https://github.com/py-pdf/pypdf) | 7.1.0 | BSD-3-Clause | 改写页面内嵌图片（压缩）、按队列合并 |
+| [Pillow](https://python-pillow.org/) | 13.0.0 | MIT-CMU | 图片解码、缩略图合成、JPEG 编码 |
+
+四者都与 MIT 兼容，不需要改变 ZZBox 的授权，也没有源码开放义务。
+
+### 为什么不用 PyMuPDF
+
+PyMuPDF 功能更全，但它是 **AGPL-3.0**。AGPL 的传染性覆盖"通过网络提供服务"的场景，把它静态打进分发包会让整个 ZZBox 被迫以 AGPL 发布 —— 与本项目的 MIT 定位直接冲突。
+
+PDFium 是渲染引擎，只读 —— 它没有任何修改 PDF 对象的 API，所以「只换页面里的图片、不动文字层」这件事它做不了。这一项交给 pypdf：纯 Python 实现，能直接拿到 `/XObject` 流对象并改写，许可证是 BSD-3-Clause。
+
+两条管线各管一段：
+
+  · pypdfium2 —— 渲染缩略图、按队列整页搬运（旋转、合并、拆页），快且稳
+  · pypdf —— 压缩时重编码页面内嵌图片，保住文字层和页面尺寸
+
+缺的仍然是 PDF 编辑（改文字、重排段落）和 OCR，这两项本来就不在工具箱的范围内。
+
+### 分发时你需要做什么
+
+Apache-2.0、BSD-3-Clause 都要求保留版权声明与许可证全文。`_internal/` 目录下的库文件自带 `*.dist-info/LICENSE*`，PyInstaller 会一并收集；如果你自行裁剪分发包，注意不要把 `pypdfium2-*.dist-info/` 和 `PIL/` 下的许可证文件删掉。
+
+---
+
+## 4. Qt for Python（PySide6）— LGPLv3
 
 | 项目 | 内容 |
 |---|---|
@@ -70,7 +139,7 @@ LGPLv3 全文：<https://www.gnu.org/licenses/lgpl-3.0.txt>
 
 ---
 
-## 3. Python 运行时
+## 5. Python 运行时
 
 | 项目 | 内容 |
 |---|---|
@@ -80,7 +149,7 @@ LGPLv3 全文：<https://www.gnu.org/licenses/lgpl-3.0.txt>
 
 ---
 
-## 4. 编解码器专利（重要提醒）
+## 6. 编解码器专利（重要提醒）
 
 FFmpeg 的**软件**许可证（GPL）和**编解码器专利**是两件不同的事：
 
@@ -94,6 +163,6 @@ FFmpeg 的**软件**许可证（GPL）和**编解码器专利**是两件不同�
 
 ---
 
-## 5. 图标
+## 7. 图标
 
 `assets/` 下的图标由本项目作者绘制，随源码以 MIT 授权。

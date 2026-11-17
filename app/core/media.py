@@ -49,12 +49,26 @@ class MediaInfo:
     vbitrate: int = 0
     pix_fmt: str = ""
     size: int = 0
+    # 色彩标签。源文件大多不写这几个字段（ffprobe 报 unknown），
+    # 但一旦写了就必须照着它转，否则 RGB 往返一次就偏色。
+    color_range: str = ""
+    color_space: str = ""
+    color_transfer: str = ""
     audio: list[AudioTrack] = field(default_factory=list)
     error: str = ""
 
     @property
     def ok(self) -> bool:
         return not self.error and self.width > 0 and self.height > 0
+
+    @property
+    def is_rgb(self) -> bool:
+        """源本身就是 RGB 编码（gbrp / gbr0 / rgb24 …）。
+
+        这类视频直接交给 NVENC 会被编成 HEVC Rext + gbrp，播放器按 YUV 解，
+        画面就是一片绿配品红。压缩面板据此决定要不要强制转 yuv420p。
+        """
+        return self.pix_fmt.startswith(("gbr", "rgb", "bgr"))
 
     @property
     def resolution_text(self) -> str:
@@ -177,6 +191,9 @@ def probe_media(path: str | Path) -> MediaInfo:
             info.height = int(st.get("height") or 0)
             info.vcodec = st.get("codec_name", "")
             info.pix_fmt = st.get("pix_fmt", "")
+            info.color_range = st.get("color_range", "") or ""
+            info.color_space = st.get("color_space", "") or ""
+            info.color_transfer = st.get("color_transfer", "") or ""
             info.fps = _parse_fps(st.get("avg_frame_rate") or st.get("r_frame_rate") or "")
             info.vbitrate = int(_to_float(st.get("bit_rate")))
             if not info.duration:

@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-APP_TITLE = "舟舟视频工具箱（ZZBox）"
+APP_TITLE = "舟舟工具箱（ZZBox）"
 
 
 class Tray(QObject):

@@ -11,12 +11,14 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
     QRubberBand,
     QSizePolicy,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -158,6 +160,215 @@ class ChipGroup(QWidget):
                     if b.isEnabled():
                         self.set_value(k, emit=True)
                         break
+
+
+class _TabStrip(QWidget):
+    """页签条：自己画那条贯穿底部的分隔线，并在活动页签处断开。
+
+    断开这一笔是整个「属性对话框」观感的关键——活动页签的底色和下方内容区
+    连成一片，看上去才像同一个面。交给样式表是做不到的（QSS 没有「在某个
+    子控件位置截断边框」这种能力），所以只能自己画。
+    """
+
+    TAB_H = 30
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setFixedHeight(self.TAB_H)
+        lay = QHBoxLayout(self)
+        # 页签从内容区左边缘起算，和下方卡片左对齐
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self._lay = lay
+        self._buttons: list[QPushButton] = []
+        self._active = 0
+
+    def add_tab(self, text: str, tip: str = "") -> QPushButton:
+        btn = QPushButton(text, self)
+        btn.setObjectName("ptab")
+        btn.setCheckable(True)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(self.TAB_H)
+        if tip:
+            btn.setToolTip(tip)
+        # 用 0 宽度占位，真实宽度交给字体度量，避免中英文混排时页签忽宽忽窄
+        fm = btn.fontMetrics()
+        btn.setFixedWidth(fm.horizontalAdvance(text) + 36)
+        self._lay.addWidget(btn)
+        self._buttons.append(btn)
+        return btn
+
+    def finish(self) -> None:
+        self._lay.addStretch(1)
+
+    def set_active(self, index: int) -> None:
+        self._active = index
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        y = self.height() - 1
+        color = QColor(style.BORDER_STRONG)
+        btn = (
+            self._buttons[self._active]
+            if 0 <= self._active < len(self._buttons)
+            else None
+        )
+        if btn is None:
+            painter.fillRect(0, y, self.width(), 1, color)
+            return
+        g = btn.geometry()
+        painter.fillRect(0, y, max(0, g.left()), 1, color)
+        painter.fillRect(
+            g.right() + 1, y, max(0, self.width() - g.right() - 1), 1, color
+        )
+
+
+class PropertyTabs(QWidget):
+    """Windows 属性对话框风格的页签容器：页签条 + 内容面板。
+
+    与 QTabWidget 的区别只有一个，但那一个是刚需：面板顶边必须在活动页签
+    处断开，让页签和内容连成一体。QTabWidget 的 pane 是完整矩形，做不出来。
+    """
+
+    currentChanged = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        # 高度跟着内容走：让网格/外层布局不要把它拉长，否则卡片会被摊开
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.strip = _TabStrip()
+        outer.addWidget(self.strip)
+
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("ptabpane")
+        outer.addWidget(self.stack)
+
+        self._buttons: list[QPushButton] = []
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+
+    # ------------------------------------------------------------------
+    def add_page(self, widget: QWidget, title: str, tip: str = "") -> int:
+        btn = self.strip.add_tab(title, tip)
+        btn.clicked.connect(lambda _=False, w=widget: self.setCurrentWidget(w))
+        self._group.addButton(btn)
+        self._buttons.append(btn)
+        idx = self.stack.addWidget(widget)
+        if idx == 0:
+            btn.setChecked(True)
+        return idx
+
+    def setCurrentIndex(self, index: int) -> None:  # noqa: N802
+        if not (0 <= index < self.stack.count()):
+            return
+        self.stack.setCurrentIndex(index)
+        self._buttons[index].setChecked(True)
+        self.strip.set_active(index)
+        self.currentChanged.emit(index)
+
+    def finish_tabs(self) -> None:
+        """所有页签都加完后调用：补一个弹性空白，把页签压在左边。"""
+        self.strip.finish()
+
+    def setCurrentWidget(self, widget: QWidget) -> None:
+        self.setCurrentIndex(self.stack.indexOf(widget))
+
+    def currentIndex(self) -> int:  # noqa: N802
+        return self.stack.currentIndex()
+
+    def button(self, index: int) -> QPushButton | None:
+        if 0 <= index < len(self._buttons):
+            return self._buttons[index]
+        return None
+
+
+class OptionPanel(QFrame):
+    """集成化参数面板：一张扁卡片，内部按「标签 + 控件」铺成网格。
+
+    取代原来 2×2 四张 Card 的布局。四张卡每张都有标题行和说明行，光这些
+    装饰就吃掉一百多像素 —— 那是整整三条队列的高度。参数本身一行就够，
+    说明挪进 tooltip，视觉上从「四个盒子」变成一个「参数表」，队列因此
+    多出三四行可见区域。
+    """
+
+    def __init__(self, cols: int = 2, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("optpanel")
+        self._cols = max(1, cols)
+        self._row = 0
+        self._col = 0
+        self._cells: list[QWidget] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(8)
+
+        self._grid = QGridLayout()
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(18)
+        self._grid.setVerticalSpacing(8)
+        outer.addLayout(self._grid)
+        for c in range(self._cols):
+            self._grid.setColumnStretch(c, 1)
+
+        self.note = QLabel("")
+        self.note.setObjectName("hint")
+        self.note.setWordWrap(True)
+        outer.addWidget(self.note)
+
+        # 警示行：临时空间不足、显存吃紧这类「动手前必须看一眼」的话。
+        # 默认隐藏 —— 常态下不占高度，出现时才顶掉一行队列。
+        self.alert = QLabel("")
+        self.alert.setObjectName("alert")
+        self.alert.setWordWrap(True)
+        self.alert.hide()
+        outer.addWidget(self.alert)
+        # 两个页签的参数行数不同（压缩页 2 行、AI 页 3 行），stack 会把
+        # 矮的那页拉到高的那页的高度。多余空间给这个弹簧，参数就钉在上方，
+        # 否则 label 会被拉开，行距看着忽宽忽窄。
+        outer.addStretch(1)
+
+    # ------------------------------------------------------------------
+    def add(self, label: str, widget: QWidget, tag_w: int = 48) -> QWidget:
+        """放一个「标签 + 控件」格子，按列数自动换行。"""
+        cell = QWidget()
+        lay = QHBoxLayout(cell)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        tag = QLabel(label)
+        tag.setObjectName("optlabel")
+        tag.setFixedWidth(tag_w)
+        lay.addWidget(tag)
+        lay.addWidget(widget, 1)
+
+        if self._col >= self._cols:
+            self._col = 0
+            self._row += 1
+        self._grid.addWidget(cell, self._row, self._col)
+        self._col += 1
+        self._cells.append(cell)
+        return cell
+
+    def add_row(self, widget: QWidget) -> None:
+        """独占一整行（滑块、长说明这类压不进半格的控件）。"""
+        if self._col:
+            self._col = 0
+            self._row += 1
+        self._grid.addWidget(widget, self._row, 0, 1, self._cols)
+        self._row += 1
+
+    def set_note(self, text: str) -> None:
+        self.note.setText(text)
+
+    def set_alert(self, text: str) -> None:
+        """设置警示行；传空串即隐藏。"""
+        self.alert.setText(text)
+        self.alert.setVisible(bool(text))
 
 
 QUEUE_COLUMNS = ("文件名", "原始格式", "导出格式", "原始大小", "预计导出大小", "操作")
@@ -330,11 +541,18 @@ class QueueTable(QTableWidget):
 
     表格只负责“长成表格的样子”和拖拽落点解析；每一格显示什么由主窗口
     算好后 setText，避免把业务规则塞进控件。
+
+    视频和图片共用一个实现：列数和列语义完全一样（文件名 / 原始格式 /
+    导出格式 / 原始大小 / 预计导出大小 / 操作），差别只有空态提示那句话。
     """
 
     reordered = Signal(int, int)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        empty_text: str = "把视频文件拖到这里，或点右上角“+”添加文件",
+    ):
         super().__init__(0, len(QUEUE_COLUMNS), parent)
         self.setObjectName("queueTable")
         self.setHorizontalHeaderLabels(list(QUEUE_COLUMNS))
@@ -401,7 +619,7 @@ class QueueTable(QTableWidget):
         self.setMinimumHeight(158)
 
         # 空队列时表格只剩一条表头，看着像坏了；给一行提示文字
-        self.empty = QLabel("把视频文件拖到这里，或点右上角“+”添加文件", self.viewport())
+        self.empty = QLabel(empty_text, self.viewport())
         self.empty.setObjectName("emptyHint")
         self.empty.setAlignment(Qt.AlignCenter)
         self.empty.setAttribute(Qt.WA_TransparentForMouseEvents, True)
