@@ -56,6 +56,8 @@ UID_ROLE = Qt.UserRole + 1
 # 拼进文本，是因为它要单独控制字号和颜色，而且随时可能被估算结果刷新
 SUB_ROLE = Qt.UserRole + 2
 SUB_TONE_ROLE = Qt.UserRole + 3
+# 缩略图右上角的绿色小角标（如「已压缩」）。空字符串就是不画。
+BADGE_ROLE = Qt.UserRole + 4
 
 
 class _PageDelegate(QStyledItemDelegate):
@@ -94,15 +96,35 @@ class _PageDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 7, 7)
 
         # ---- 缩略图：水平居中贴顶
+        icon_target: QRect | None = None
         icon = index.data(Qt.DecorationRole)
         if isinstance(icon, QIcon) and not icon.isNull():
             iw, ih = self.icon_w, self.icon_h
             target = QRect(
                 rect.left() + (rect.width() - iw) // 2, rect.top() + self.pad_top, iw, ih
             )
+            icon_target = target
             icon.paint(
                 painter, target, Qt.AlignCenter, QIcon.Normal, QIcon.Off
             )
+
+        # ---- 右上角绿色角标（「已压缩」）：贴着缩略图右上，压在图上
+        badge = index.data(BADGE_ROLE) or ""
+        if badge and icon_target is not None:
+            bf = QFont(option.font)
+            bf.setPixelSize(9)
+            bf.setBold(True)
+            painter.setFont(bf)
+            bfm = painter.fontMetrics()
+            tw = bfm.horizontalAdvance(str(badge))
+            bw, bh = tw + 12, 16
+            bx = icon_target.right() - bw + 4   # 稍微探出卡片右缘，像截图那样
+            by = icon_target.top() - 2
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#2f9e63"))   # 绿底
+            painter.drawRoundedRect(QRect(bx, by, bw, bh), 4, 4)
+            painter.setPen(QColor("#ffffff"))    # 白字
+            painter.drawText(QRect(bx, by, bw, bh), Qt.AlignCenter, str(badge))
 
         # ---- 两行字
         title = index.data(Qt.DisplayRole) or ""
@@ -159,6 +181,7 @@ class PageGrid(QListWidget):
 
     order_changed = Signal(list)      # 排序变化后新的 uid 顺序
     zoom_changed = Signal(int)        # 当前单格宽度
+    context_requested = Signal(object, object)  # (选中的 uid 列表, 全局坐标)
 
     ZOOM_MIN = 92
     ZOOM_MAX = 268
@@ -299,6 +322,14 @@ class PageGrid(QListWidget):
         item.setData(SUB_TONE_ROLE, tone)
         tip = item.toolTip().split("\n")[0]
         item.setToolTip(f"{tip}\n{text}" if text else tip)
+
+    def set_badge(self, uid: str, text: str) -> None:
+        """缩略图右上角的角标。空字符串清除；改动会触发重绘。"""
+        item = self._item_of(uid)
+        if item is None:
+            return
+        item.setData(BADGE_ROLE, text)
+        self.viewport().update()
 
     def set_thumb(self, uid: str, png: bytes) -> None:
         item = self._item_of(uid)
@@ -486,6 +517,24 @@ class PageGrid(QListWidget):
         self._press_pos = None
         self._press_uid = None
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        """右键：右击未选中的格子先把它选中，再把菜单交给主窗口。
+
+        菜单项要对着"当前选中的这一批"操作，所以控件的职责只到「告诉你
+        选中了谁、鼠标在哪」，具体有哪些动作由主窗口决定 —— 否则这个
+        通用控件就得反过来认识旋转、导出、压缩这些业务概念。
+        """
+        if self._dragging:
+            return
+        item = self.itemAt(event.pos())
+        if item is not None and item.data(UID_ROLE) not in self.selected_uids():
+            self.setCurrentItem(item)
+        uids = self.selected_uids()
+        if not uids:
+            return
+        self.context_requested.emit(uids, event.globalPos())
+        event.accept()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if self._dragging and event.key() == Qt.Key_Escape:

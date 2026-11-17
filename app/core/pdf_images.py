@@ -22,11 +22,17 @@ pypdf 的 StreamObject.set_data() 只接受 FlateDecode 流（改 JPEG 流会直
 write_to_stream 会把 _data 原样写出并按 len(_data) 重算 /Length。
 
 哪些图片会被跳过（宁可少压，也不能压坏）：
-  · 带 /SMask 的（有透明通道，JPEG 存不了 alpha）
-  · /ImageMask 蒙版图
-  · 带 /Decode 数组的（反相或自定义映射，重编码会变色）
-  · 解码不了的（JPX/CMYK 之类）
+  · /ImageMask 蒙版图、/Indexed /Separation /Pattern 等特殊色彩空间
+  · 带自定义 /Decode 的（反相映射，重编码会变色）
+  · 解码不了的
   · 重编码之后反而更大的（已经很小的图，再压就只剩块效应）
+
+关于 SMask 和 CMYK（印刷设计稿的关键，别再保守过头）：
+  · 带 /SMask 的图照常压 —— 只重编码颜色通道，蒙版对象原样保留，
+    透明度一点不变。海报里抠出来的人物图都是这一类。
+  · DeviceCMYK / ICCBased 4 分量照常压 —— 用 CMYK JPEG 重编码，
+    写回时配 /Decode [1 0 1 0 1 0 1 0]（Adobe CMYK JPEG 标准）。
+    实测这样和原图渲染差异 < 0.01/255；不配会偏色。
 """
 
 from __future__ import annotations
@@ -52,8 +58,9 @@ QUALITY_MAX = 100
 QUALITY_DEFAULT = 78
 
 # 解码后允许重编码的 Pillow 模式。其余（P 调色板、1bit 二值、RGBA）转 RGB
-# 之后体积经常不降反升，或者本身就是小图标，不值得动
-_OK_MODES = ("RGB", "L")
+# 之后体积经常不降反升，或者本身就是小图标，不值得动。
+# CMYK 是印刷 PDF 的主角，Pillow 原生支持 CMYK JPEG，必须放进来。
+_OK_MODES = ("RGB", "L", "CMYK")
 
 
 class PdfImageError(PdfError):
@@ -216,41 +223,104 @@ def _icc_components(obj, cs) -> int | None:
         return None
 
 
+def _is_cmyk(obj) -> bool:
+    """色彩空间是不是 4 分量 CMYK（DeviceCMYK 或 ICCBased N=4）。"""
+    cs = _as_dict(obj.get("/ColorSpace"))
+    if isinstance(cs, str):
+        return cs == "/DeviceCMYK"
+    if isinstance(cs, ArrayObject) and len(cs) >= 2:
+        return _as_dict(cs[0]) == "/ICCBased" and _icc_components(obj, cs) == 4
+    return False
+
+
+def _is_standard_cmyk_decode(obj) -> bool:
+    """/Decode 是 Adobe CMYK JPEG 的标准反相数组吗？
+    这个数组不是"自定义映射"，压完还要照写回去，不能当跳过理由。
+    """
+    dec = obj.get("/Decode")
+    if dec is None:
+        return True
+    try:
+        vals = [int(_as_dict(x)) for x in dec]
+    except (TypeError, ValueError):
+        return False
+    return vals in ([1, 0, 1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 1, 0, 1])
+
+
+def _pixel_mode(obj) -> str:
+    """FlateDecode 原始像素该用哪种 Pillow 模式装。"""
+    if _is_cmyk(obj):
+        return "CMYK"
+    cs = _as_dict(obj.get("/ColorSpace"))
+    if isinstance(cs, ArrayObject) and len(cs) >= 2 and _as_dict(cs[0]) == "/ICCBased":
+        return {1: "L", 3: "RGB"}.get(_icc_components(obj, cs) or 0, "RGB")
+    if isinstance(cs, str) and cs == "/DeviceGray":
+        return "L"
+    return "RGB"
+
+
 def _skip_reason(obj) -> str:
-    """不解码就能判断的跳过条件。返回空串表示"可以试着压"。"""
-    if obj.get("/SMask") is not None:
-        return "有透明遮罩"
+    """不解码就能判断的跳过条件。返回空串表示"可以试着压"。
+
+    注意：/SMask 不再当跳过理由。带蒙版的图只压颜色通道、蒙版原样保留，
+    这样印刷设计稿里抠出来的人物图也能压。CMYK 同样支持。
+    """
     if obj.get("/ImageMask") in (True, "/True"):
         return "蒙版图"
-    if obj.get("/Decode") is not None:
+    if obj.get("/Decode") is not None and not (
+        _is_cmyk(obj) and _is_standard_cmyk_decode(obj)
+    ):
         return "自定义颜色映射"
     raw_cs = obj.get("/ColorSpace")
     if raw_cs is None:
         return ""
     cs = _as_dict(raw_cs)
-    if isinstance(cs, str) and cs in ("/DeviceCMYK", "/Separation", "/Pattern"):
+    if isinstance(cs, str) and cs in ("/Separation", "/Pattern"):
         return f"{cs} 色彩空间"
     if isinstance(cs, ArrayObject) and len(cs):
         head = _as_dict(cs[0])
         if head in ("/Indexed", "/Separation"):
             return f"{head} 色彩空间"
-        if _icc_components(obj, cs) == 4:
-            return "CMYK 色彩空间"
     return ""
 
 
 def _reencode(obj, quality: int) -> tuple[bytes, str] | None:
-    """把一张图重新编码成 JPEG。返回 (字节, Pillow模式)；压不动返回 None。"""
+    """把一张图重新编码成 JPEG。返回 (字节, Pillow模式)；压不动返回 None。
+
+    pypdf 的 get_data() 对不同 Filter 给的东西不一样：
+      · DCTDecode  →  JPEG 流本身（压缩字节），要交给 Image.open 解
+      · FlateDecode / 无 Filter  →  解码后的原始像素，要按色彩空间 frombytes
+    之前只写了前一种，所以印刷 PDF 里成片的 Flate+CMYK 图全军覆没。
+    """
+    filt = _as_dict(obj.get("/Filter"))
     try:
         raw = obj.get_data()
-        im = Image.open(io.BytesIO(raw))
-        im.load()
+        if isinstance(filt, str) and filt in ("/DCTDecode", "/DCT"):
+            im = Image.open(io.BytesIO(raw))
+            im.load()
+        elif filt is None or (isinstance(filt, str) and filt in ("/FlateDecode", "/Fl")):
+            w = int(obj.get("/Width", 0))
+            h = int(obj.get("/Height", 0))
+            bpc = int(obj.get("/BitsPerComponent", 8) or 8)
+            if bpc != 8 or w <= 0 or h <= 0:
+                return None
+            mode = _pixel_mode(obj)
+            ch = {"L": 1, "RGB": 3, "CMYK": 4}[mode]
+            if len(raw) == w * h * ch:
+                im = Image.frombytes(mode, (w, h), raw)
+            else:
+                # 对不上就别硬塞，可能是 predictor 之类的边缘情况
+                im = Image.open(io.BytesIO(raw))
+                im.load()
+        else:
+            # JPX/CCITT/RunLength 等，保守放过
+            return None
     except Exception:  # noqa: BLE001
         return None
 
     mode = im.mode
     if mode in ("RGBA", "LA", "PA"):
-        return None                      # 有 alpha，JPEG 存不了
+        return None                      # 有 alpha，JPEG 存不了（SMask 单独保留）
     if mode == "P":
         # 调色板多半是小图标/线条，转 RGB 之后经常变大，直接放过
         return None
@@ -278,6 +348,9 @@ def _write_back(obj, data: bytes, mode: str) -> None:
     pypdf 的 set_data() 只认 FlateDecode，这里直接改 _data ——
     StreamObject.write_to_stream 会原样写出 _data 并按长度重算 /Length。
     """
+    # 改 Filter 之前记下来源：Flate 原始像素重编码的 CMYK 要补 Adobe Decode；
+    # 原本就是 DCTDecode 的 CMYK，Pillow 读出来已带 Adobe 语义，再补就反两次色
+    was_jpeg = _as_dict(obj.get("/Filter")) in ("/DCTDecode", "/DCT")
     obj._data = data
     # get_data() 会把解码结果缓存进 decoded_self，不清掉的话后面读到的
     # 还是旧像素（导出时不会再读，但清一下更安全）
@@ -287,6 +360,23 @@ def _write_back(obj, data: bytes, mode: str) -> None:
         del obj["/DecodeParms"]
     obj[NameObject("/BitsPerComponent")] = NumberObject(8)
 
+    if mode == "CMYK":
+        # Flate 原始像素 → Pillow 存的 Adobe CMYK JPEG（字节值反相），
+        # PDF 里必须配这个 Decode 数组才不偏色（实测不写色差 6.2/255）。
+        # 原本就是 DCTDecode 的图，Pillow 读进来已带 Adobe 语义，重存后
+        # 直接就是对的，再补 Decode 反而偏色（实测 2.5/255）。
+        # 色彩空间一律保持原样，DeviceCMYK / ICCBased 4 分量都别改。
+        if not was_jpeg:
+            obj[NameObject("/Decode")] = ArrayObject(
+                [NumberObject(x) for x in (1, 0, 1, 0, 1, 0, 1, 0)]
+            )
+        elif "/Decode" in obj:
+            del obj["/Decode"]
+        return
+
+    # 非 CMYK 别留着反相数组，否则灰度/彩图会反过来
+    if "/Decode" in obj:
+        del obj["/Decode"]
     cs = _as_dict(obj.get("/ColorSpace"))
     n = _icc_components(obj, cs) if isinstance(cs, ArrayObject) else None
     if mode == "L":
@@ -451,6 +541,29 @@ def stage_page(
     return out
 
 
+def _append_image_ref(writer: PdfWriter, ref: PageRef) -> None:
+    """把一张图片作为新页并进 writer。
+
+    压缩后的图片落在软件目录的临时文件夹里，但导出时它仍然是队列里的
+    一页。pypdf 没有"从图片建页"的接口，先用 Pillow 包成单页 PDF 再搬，
+    和 pdfium 那条管线的 _append_image_page 是同一个意思。
+    """
+    try:
+        with Image.open(ref.src) as im:
+            page_im = im if im.mode in ("RGB", "L") else im.convert("RGB")
+            buf = io.BytesIO()
+            page_im.save(buf, format="PDF", resolution=150.0)
+    except Exception as exc:  # noqa: BLE001
+        raise PdfImageError(f"读不出图片 {Path(ref.src).name}：{exc}") from exc
+    buf.seek(0)
+    reader = PdfReader(buf)
+    if not reader.pages:
+        raise PdfImageError(f"{Path(ref.src).name} 不是有效图片")
+    writer.add_page(reader.pages[0])
+    if ref.rotate:
+        writer.pages[-1].rotate(ref.rotate)
+
+
 def merge_pdf(
     refs: list[PageRef],
     out_path: str | Path,
@@ -478,6 +591,11 @@ def merge_pdf(
         done: dict[str, set] = {}
         for i, ref in enumerate(refs):
             _check_cancel(cancel)
+            if ref.kind == "image":
+                _append_image_ref(writer, ref)
+                if progress is not None:
+                    progress(int((i + 1) / total * 100))
+                continue
             key = (ref.src, ref.index, ref.rotate % 360)
             staged_path = staged.get(key)
             if staged_path and Path(staged_path).exists():

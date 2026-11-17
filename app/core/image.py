@@ -344,13 +344,51 @@ def make_output_path(
     return path
 
 
+def preview_compress_bytes(
+    src: Path,
+    s: ImageSettings,
+    info: ImageInfo | None = None,
+) -> int:
+    """按图片工作台的方案真编一次到内存，返回字节数。
+
+    给 PDF 队列拖质量条时做实时预估用。必须和 build_compress_steps
+    使用同一套格式 / 质量 / 长边，否则预估说 66kb、压出来 102kb，
+    用户会以为数字是编的。
+    """
+    import io
+
+    from PIL import Image
+
+    info = info or probe_image(src)
+    fmt = out_format(info, s)
+    w, h = target_size(info, s, 1)
+    with Image.open(src) as im:
+        pic = im if im.mode in ("RGB", "L") else im.convert("RGB")
+        if w and h and (w, h) != pic.size:
+            pic = pic.resize((w, h), Image.LANCZOS)
+        buf = io.BytesIO()
+        if fmt == "png":
+            pic.save(buf, format="PNG", optimize=True)
+        elif fmt == "webp":
+            pic.save(buf, format="WEBP", quality=s.quality, method=4)
+        else:
+            pic.save(buf, format="JPEG", quality=s.quality, optimize=True)
+    return len(buf.getvalue())
+
+
 def build_compress_steps(
     ffmpeg: str,
     src: Path,
     s: ImageSettings,
     info: ImageInfo,
+    out_path: Path | None = None,
 ) -> tuple[list[list[str]], Path, str]:
-    """纯压缩：一条 ffmpeg 命令搞定，返回 (步骤, 输出路径, 错误)。"""
+    """纯压缩：一条 ffmpeg 命令搞定，返回 (步骤, 输出路径, 错误)。
+
+    out_path 给了就写到那里 —— PDF 工作台压缩图片时要落到软件目录的
+    临时文件夹，绝不能覆盖用户的原图。不给则照旧按图片工作台的规则
+    生成「_压缩」文件名。
+    """
     fmt = out_format(info, s)
     w, h = target_size(info, s, 1)
     if not (w and h):
@@ -367,7 +405,9 @@ def build_compress_steps(
         vf.append("format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a=255")
     filt = ",".join(vf) if vf else "null"
 
-    out = make_output_path(src, s, info)
+    out = Path(out_path) if out_path is not None else make_output_path(src, s, info)
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
         "-i", str(src), "-frames:v", "1", "-vf", filt,

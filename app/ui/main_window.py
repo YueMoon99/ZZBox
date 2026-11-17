@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QCursor, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -73,6 +75,7 @@ from app.core.image import (
     build_ai_steps,
     build_compress_steps,
     plan_summary,
+    preview_compress_bytes,
     probe_image,
     warnings_for,
 )
@@ -92,7 +95,7 @@ from app.core.pdf import (
 )
 from app.core.pdf_runner import PdfRunner
 from app.core.pdf_images import PageStat, estimate_pdf, merge_pdf, stage_page
-from app.core.probe import EnvInfo, probe_environment
+from app.core.probe import EnvInfo, probe_environment, _find_tool
 from app.core.runner import EncodeRunner
 from app.ui import icons, style
 from app.ui.page_grid import PageGrid
@@ -145,6 +148,10 @@ class PdfItem:
     # 200 页的队列删一格就重渲染全部，会卡好几秒
     thumb_png: bytes = b""
     origin: str = ""        # 来源文件名，导出分组时用
+    size: int = 0           # 源文件字节数；PDF 页拿不到单页体积，留 0
+    staged: str = ""        # 压缩后的临时文件路径（图片用，直接换 ref.src）
+    origin_src: str = ""    # 压缩前的 src，Ctrl+Z 用它换回来
+    origin_kind: str = ""   # 压缩前的 kind
 
 
 def _fmt_bytes(n: float) -> str:
@@ -157,6 +164,16 @@ def _fmt_bytes(n: float) -> str:
     return f"{int(n)} B"
 
 
+def _kb(n: float) -> str:
+    """格子下面一行放得下的紧凑体积：88kb / 1640kb。"""
+    return f"{max(1, round(n / 1024))}kb"
+
+
+def _pair_text(cur: float, est: float) -> str:
+    """用户要的那句提示：88kb→66kb。"""
+    return f"{_kb(cur)}→{_kb(est)}"
+
+
 class _Emitter(QObject):
     env_ready = Signal(object)
     meta_ready = Signal(object)
@@ -166,6 +183,8 @@ class _Emitter(QObject):
     # 估算结果 —— 用户拖一下质量条，上一轮的几十页结果会陆续飘回来，
     # 不认代次的话界面上会出现"旧质量算出来的数字"混在新数字里
     pdf_stat_ready = Signal(int, str, int, object)
+    # 估算失败也要回报，否则格子会永远停在「估算中…」
+    pdf_stat_failed = Signal(int, str, int, str)
 
 
 class MainWindow(QMainWindow):
@@ -230,9 +249,9 @@ class MainWindow(QMainWindow):
         self._pdf_kind = ""
         self._pdf_t0 = 0.0
         self._pdf_result = ""
-        # 压缩区状态：off / pick / all / part（见 _pdf_zip_panel 的注释）
-        self._pdf_zip_mode = "off"
         self._pdf_stats: dict[tuple[str, int], PageStat] = {}
+        # 估算过但失败的页：别让它一直挂「估算中」，也别每次拖滑块都重试
+        self._pdf_est_failed: set[tuple[str, int]] = set()
         # (源文件, 页号, 质量) → 统计。来回点选同一页时不用重新解码
         self._pdf_stat_cache: dict[tuple[str, int, int], PageStat] = {}
         self._pdf_est_key: tuple | None = None
@@ -243,6 +262,13 @@ class MainWindow(QMainWindow):
         self._pdf_staged: dict[tuple[str, int, int], str] = {}
         self._pdf_stage_dir: Path | None = None
         self._pdf_zip_results: list = []
+        # 压缩轮次：每点一次「确认压缩」自增，暂存子目录按轮次命名。
+        # 同一页可以反复压缩，每一轮留一份，Ctrl+Z 才能逐级回退。
+        self._pdf_zip_round = 0
+        # Ctrl+Z 的快照栈：每一步队列操作前压一份，撤销就是整份换回来
+        self._pdf_undo_stack: list[list[tuple]] = []
+        self._pdf_compress_uids: list[str] = []
+        self._pdf_pair_cache: dict[str, str] = {}
         self._quitting = False
         self._tray_hinted = False
         self.tray: Tray | None = None
@@ -253,6 +279,7 @@ class MainWindow(QMainWindow):
         self.emitter.img_meta_ready.connect(self._on_img_meta)
         self.emitter.pdf_thumb_ready.connect(self._on_pdf_thumb)
         self.emitter.pdf_stat_ready.connect(self._on_pdf_stat)
+        self.emitter.pdf_stat_failed.connect(self._on_pdf_stat_failed)
 
         self.runner = EncodeRunner(self)
         self.runner.progress.connect(self._on_progress)
@@ -388,6 +415,10 @@ class MainWindow(QMainWindow):
         self.progress_fill.setGeometry(0, 0, 0, 6)
         self.progress_fill.setStyleSheet("background:#378add; border-radius:3px;")
         self._progress_pct = 0
+        # 阶段分界刻度。多阶段任务（拆帧 / 超分 4× / 降采样 → 2× / 合成）
+        # 只在一条进度条上跑，不画出分界就看不出当前在第几步
+        self._prog_marks: list[QLabel] = []
+        self._stage_bounds: list[float] = []
         left.addWidget(self.progress)
         fl.addLayout(left, 1)
 
@@ -634,9 +665,10 @@ class MainWindow(QMainWindow):
         一「个文件」。一份 80 页的扫描件拖进来就是 80 格，用户对着页面
         排序、删页、旋转，导出的就按这个顺序落盘。
 
-        下方只有「旋转选中」「导出选中」两个按钮。压缩功能区已整块移除，
-        这里不再有任何参数项 —— 页面格墙因此能多占一行，最小窗口下也不
-        挤。
+        所有针对选中页的动作（旋转 / 导出 / 压缩 / 删除）都收在格墙的
+        右键菜单里，面板上不再摆一排按钮。压缩质量条只在点了「压缩选中」
+        之后才出现，平时整块隐藏，页面格墙能多占一行。
+        Ctrl+Z 在这张页里回退上一步队列操作。
         """
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -661,13 +693,6 @@ class MainWindow(QMainWindow):
         self.pdf_btn_all.setCursor(Qt.PointingHandCursor)
         self.pdf_btn_all.clicked.connect(self._pdf_select_all)
 
-        self.pdf_btn_del = QPushButton("删除所选")
-        self.pdf_btn_del.setObjectName("link")
-        self.pdf_btn_del.setCursor(Qt.PointingHandCursor)
-        self.pdf_btn_del.setToolTip("把选中的页面从队列里移除（不动源文件）")
-        self.pdf_btn_del.setEnabled(False)
-        self.pdf_btn_del.clicked.connect(self._pdf_delete_selected)
-
         self.pdf_btn_clear = QPushButton("清空")
         self.pdf_btn_clear.setObjectName("link")
         self.pdf_btn_clear.setCursor(Qt.PointingHandCursor)
@@ -677,7 +702,6 @@ class MainWindow(QMainWindow):
         head.addStretch(1)
         head.addWidget(self.pdf_btn_add)
         head.addWidget(self.pdf_btn_all)
-        head.addWidget(self.pdf_btn_del)
         head.addWidget(self.pdf_btn_clear)
         lay.addLayout(head)
 
@@ -685,9 +709,13 @@ class MainWindow(QMainWindow):
         self.pdf_grid = PageGrid(
             empty_text="把 PDF 或图片拖到这里\n多页 PDF 会自动展开成多个页面"
         )
-        self.pdf_grid.setToolTip("单击 / Shift 连选 / Ctrl 加选 · 拖动格子排序 · Ctrl+滚轮缩放")
+        self.pdf_grid.setToolTip(
+            "单击 / Shift 连选 / Ctrl 加选 · 拖动格子排序 · 右键更多操作 · "
+            "Ctrl+滚轮缩放 · Ctrl+Z 撤销"
+        )
         self.pdf_grid.order_changed.connect(self._pdf_on_reorder)
         self.pdf_grid.itemSelectionChanged.connect(self._pdf_on_selection)
+        self.pdf_grid.context_requested.connect(self._pdf_context_menu)
         frame = QFrame()
         frame.setObjectName("queue")
         fl = QVBoxLayout(frame)
@@ -696,224 +724,338 @@ class MainWindow(QMainWindow):
         fl.addWidget(self.pdf_grid)
         lay.addWidget(frame, 1)
 
-        # ---- 下方工作区：左边页面操作，右边压缩。
-        # 压缩区默认不启用 —— 它的口径和别的功能不一样（会重编码图片、
-        # 改变导出结果），不该让人一进来就撞上一堆参数
-        work = QHBoxLayout()
-        work.setContentsMargins(0, 0, 0, 0)
-        work.setSpacing(10)
-        work.addWidget(self._pdf_ops_panel())
-        work.addWidget(self._pdf_zip_panel(), 1)
-        lay.addLayout(work)
+        # ---- 压缩条：默认整块隐藏，右键「压缩选中」之后才出现
+        lay.addWidget(self._pdf_zip_panel())
+
+        undo = QShortcut(QKeySequence("Ctrl+Z"), page)
+        undo.setContext(Qt.WidgetWithChildrenShortcut)
+        undo.activated.connect(self._pdf_undo)
         return page
-
-    def _pdf_ops_panel(self) -> QWidget:
-        """左侧页面操作区：只放"对选中的页面做点什么"的按钮。"""
-        panel = QFrame()
-        panel.setObjectName("optpanel")
-        panel.setFixedWidth(150)
-        # 垂直方向跟着右边那张卡一起长高，两张卡高低不一会像没对齐
-        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        self.pdf_ops_panel = panel
-
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(6)
-
-        self.pdf_btn_rotate = QPushButton("旋转选中")
-        self.pdf_btn_rotate.setObjectName("ghost")
-        self.pdf_btn_rotate.setCursor(Qt.PointingHandCursor)
-        self.pdf_btn_rotate.setToolTip("选中的页面顺时针转 90°（再点继续叠加）")
-        self.pdf_btn_rotate.setEnabled(False)
-        self.pdf_btn_rotate.clicked.connect(self._pdf_rotate)
-
-        self.pdf_btn_extract = QPushButton("导出选中")
-        self.pdf_btn_extract.setObjectName("ghost")
-        self.pdf_btn_extract.setCursor(Qt.PointingHandCursor)
-        self.pdf_btn_extract.setToolTip(
-            "把选中的页面导出成 PDF 或图片\n"
-            "导出 PDF 时不重新渲染，文字层、链接、表单原样保留"
-        )
-        self.pdf_btn_extract.setEnabled(False)
-        self.pdf_btn_extract.clicked.connect(self._pdf_extract)
-
-        # 上下各留一段弹簧：卡片会被右侧拉高，按钮留在中间比顶在头上好看
-        lay.addStretch(1)
-        lay.addWidget(self.pdf_btn_rotate)
-        lay.addWidget(self.pdf_btn_extract)
-        lay.addStretch(1)
-        return panel
 
     # ------------------------------------------------------------ PDF 压缩区
     def _pdf_zip_panel(self) -> QWidget:
-        """压缩区。四个状态，靠显隐切换，不重建控件：
+        """右键「压缩选中」之后才出现的一条：质量 / 实时预估 / 确认。
 
-          off  未启用     → 【启用压缩功能】+ "压缩功能未启用"
-          pick 选方式     → 【压缩部分】【压缩全部】
-          all  压缩全部   → 质量条 + 提示；格子显示每页预估，导出时才压
-          part 压缩部分   → 质量条 + 【压缩选中】；只算选中页，压完回 off
-
-        为什么不做成一进来就摆满参数：这一版压缩会重编码图片、改变导出
-        结果，属于"得先想清楚再开"的功能。默认关着，想用的人点一下。
+        平时整块隐藏。点菜单项只进入调参数状态，不立刻动手；确认之后才
+        真压缩、并把压缩件静默换进队列。这样每一步都看得见，也不会因为
+        一次误点就改掉用户的文件。
         """
         panel = QFrame()
         panel.setObjectName("optpanel")
-        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.pdf_zip_panel = panel
-
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setContentsMargins(12, 8, 12, 8)
         lay.setSpacing(6)
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-
-        self.pdf_zip_enable = QPushButton("启用压缩功能")
-        self.pdf_zip_enable.setObjectName("ghost")
-        self.pdf_zip_enable.setCursor(Qt.PointingHandCursor)
-        self.pdf_zip_enable.setToolTip(
-            "只重编码页面里的图片，页面尺寸、文字层、链接都不动"
-        )
-        self.pdf_zip_enable.clicked.connect(lambda: self._pdf_zip_set("pick"))
-
-        self.pdf_zip_all = QPushButton("压缩全部")
-        self.pdf_zip_all.setObjectName("ghost")
-        self.pdf_zip_all.setCursor(Qt.PointingHandCursor)
-        self.pdf_zip_all.setToolTip("按质量压缩所有页面的图片，导出时才真正执行")
-        self.pdf_zip_all.clicked.connect(lambda: self._pdf_zip_set("all"))
-
-        self.pdf_zip_part = QPushButton("压缩部分")
-        self.pdf_zip_part.setObjectName("ghost")
-        self.pdf_zip_part.setCursor(Qt.PointingHandCursor)
-        self.pdf_zip_part.setToolTip("只压选中的页面，结果先存到临时文件")
-        self.pdf_zip_part.clicked.connect(lambda: self._pdf_zip_set("part"))
-
-        self.pdf_zip_run = QPushButton("压缩选中")
-        self.pdf_zip_run.setObjectName("ghost")
-        self.pdf_zip_run.setCursor(Qt.PointingHandCursor)
-        self.pdf_zip_run.setToolTip("立刻压缩选中的页面，结果暂存，导出时直接用")
-        self.pdf_zip_run.clicked.connect(self._pdf_zip_compress_selected)
-
-        self.pdf_zip_cancel = QPushButton("← 退出压缩")
-        self.pdf_zip_cancel.setObjectName("link")
-        self.pdf_zip_cancel.setCursor(Qt.PointingHandCursor)
-        self.pdf_zip_cancel.setToolTip("关掉压缩，回到原始导出（不压图片）")
-        self.pdf_zip_cancel.clicked.connect(lambda: self._pdf_zip_set("off"))
-
-        for btn in (
-            self.pdf_zip_enable,
-            self.pdf_zip_all,
-            self.pdf_zip_part,
-            self.pdf_zip_run,
-        ):
-            row.addWidget(btn)
-        row.addStretch(1)
-        lay.addLayout(row)
-
-        # 质量行：只在 all / part 出现。格式、长边这些选项这一版不要了 ——
-        # 图片像素尺寸和颜色空间都得原样保留，能调的只剩 JPEG 质量
-        self.pdf_zip_qwrap = QWidget()
-        qrow = QHBoxLayout(self.pdf_zip_qwrap)
-        qrow.setContentsMargins(0, 0, 0, 0)
-        qrow.setSpacing(8)
-        qlab = QLabel("质量")
-        qlab.setObjectName("optlabel")
-        qlab.setFixedWidth(30)
+        lab = QLabel("压缩质量")
+        lab.setObjectName("optlabel")
         self.pdf_zip_quality = QSlider(Qt.Horizontal)
         self.pdf_zip_quality.setRange(30, 100)
         self.pdf_zip_quality.setValue(78)
-        self.pdf_zip_quality.setToolTip("越低体积越小，画面越糊。78 是扫描件的甜点")
-        self.pdf_zip_quality.valueChanged.connect(self._pdf_zip_on_quality)
+        self.pdf_zip_quality.setToolTip(
+            "图片按这个值重新编码（和图片工作台同一套方案）；PDF 页按它压内嵌图片"
+        )
         self.pdf_zip_qv = QLabel("78")
         self.pdf_zip_qv.setFixedWidth(26)
         self.pdf_zip_qv.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        qrow.addWidget(qlab)
-        qrow.addWidget(self.pdf_zip_quality, 1)
-        qrow.addWidget(self.pdf_zip_qv)
-        lay.addWidget(self.pdf_zip_qwrap)
+        row.addWidget(lab)
+        row.addWidget(self.pdf_zip_quality, 1)
+        row.addWidget(self.pdf_zip_qv)
+        lay.addLayout(row)
 
-        # 提示行右边挂「退出压缩」。放这一行而不是按钮行：
-        # 压缩全部态按钮行是空的，退出按钮孤零零占一行很难看
-        hint_row = QHBoxLayout()
-        hint_row.setContentsMargins(0, 0, 0, 0)
-        hint_row.setSpacing(8)
-        self.pdf_zip_hint = QLabel("压缩功能未启用")
+        self.pdf_zip_hint = QLabel("")
         self.pdf_zip_hint.setObjectName("hint")
         self.pdf_zip_hint.setWordWrap(True)
-        hint_row.addWidget(self.pdf_zip_hint, 1)
-        hint_row.addWidget(self.pdf_zip_cancel, 0, Qt.AlignRight | Qt.AlignVCenter)
-        lay.addLayout(hint_row)
-        lay.addStretch(1)
+        lay.addWidget(self.pdf_zip_hint)
 
-        # 质量条拖动会连发 valueChanged，每动一格就整队重算会把界面拖死
-        self._pdf_zip_timer = QTimer(self)
-        self._pdf_zip_timer.setSingleShot(True)
-        self._pdf_zip_timer.setInterval(420)
-        self._pdf_zip_timer.timeout.connect(self._pdf_zip_estimate)
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(8)
+        self.pdf_zip_cancel = QPushButton("取消")
+        self.pdf_zip_cancel.setObjectName("link")
+        self.pdf_zip_cancel.setCursor(Qt.PointingHandCursor)
+        self.pdf_zip_cancel.clicked.connect(self._pdf_zip_close)
+        self.pdf_zip_run = QPushButton("确认压缩")
+        self.pdf_zip_run.setObjectName("ghost")
+        self.pdf_zip_run.setCursor(Qt.PointingHandCursor)
+        self.pdf_zip_run.clicked.connect(self._pdf_zip_confirm)
+        row2.addStretch(1)
+        row2.addWidget(self.pdf_zip_cancel)
+        row2.addWidget(self.pdf_zip_run)
+        lay.addLayout(row2)
 
-        self._pdf_zip_set("off")
+        self.pdf_zip_quality.valueChanged.connect(self._pdf_zip_on_quality)
+        # 拖动过程只做轻量估算；真正耗时的解码压到松开之后
+        self.pdf_zip_timer = QTimer(self)
+        self.pdf_zip_timer.setSingleShot(True)
+        self.pdf_zip_timer.setInterval(260)
+        self.pdf_zip_timer.timeout.connect(self._pdf_zip_estimate)
+        panel.setVisible(False)
         return panel
 
-    def _pdf_zip_set(self, mode: str) -> None:
-        """切换压缩区状态。切走时把上一轮的估算停掉，别让旧数字飘上来。"""
-        prev = getattr(self, "_pdf_zip_mode", "off")
-        self._pdf_zip_mode = mode
-        if mode in ("off", "pick"):
-            self._pdf_zip_stop_estimate()
-            self._pdf_zip_clear_subs()
-        if prev != mode and mode in ("all", "part"):
-            self._pdf_zip_clear_subs()
-
-        off = mode == "off"
-        pick = mode == "pick"
-        self.pdf_zip_enable.setVisible(off)
-        self.pdf_zip_all.setVisible(pick)
-        self.pdf_zip_part.setVisible(pick)
-        self.pdf_zip_run.setVisible(mode == "part")
-        # 只要不在 off，「退出压缩」就得在，否则选了压缩部分又反悔时无路可退
-        self.pdf_zip_cancel.setVisible(not off)
-        self.pdf_zip_qwrap.setVisible(mode in ("all", "part"))
-        self.pdf_zip_hint.setText(
-            {
-                "off": "压缩功能未启用",
-                "pick": "选择压缩范围：全部页面，或只压选中的几页",
-                "all": "导出时按此质量压缩所有页面的图片，文字层与页面尺寸不变",
-                "part": "只压选中的页面，压缩结果先存临时文件；压完自动关闭压缩",
-            }[mode]
-        )
-        self._pdf_zip_refresh()
-        if mode in ("all", "part"):
-            self._pdf_zip_estimate()
-
-    def _pdf_zip_refresh(self) -> None:
-        """压缩区按钮的可用性。选项跟着队列和选中走。"""
-        n = len(self.pdf_items)
-        sel = len(self.pdf_grid.selected_uids()) if hasattr(self, "pdf_grid") else 0
+    # ---------------------------------------------------------- 右键入口
+    def _pdf_context_menu(self, uids: list, pos) -> None:
+        """格墙右键：所有针对选中页的动作都在这里。"""
+        menu = QMenu(self)
+        a_rot = menu.addAction("旋转选中 90°")
+        a_exp = menu.addAction("导出选中…")
+        a_zip = menu.addAction("压缩选中…")
+        a_del = menu.addAction("删除选中")
+        menu.addSeparator()
+        a_all = menu.addAction("全选")
+        a_undo = menu.addAction("撤销  Ctrl+Z")
         busy = self._busy()
-        self.pdf_zip_enable.setEnabled(n > 0 and not busy)
-        self.pdf_zip_all.setEnabled(n > 0 and not busy)
-        self.pdf_zip_part.setEnabled(sel > 0 and not busy)
-        self.pdf_zip_run.setEnabled(sel > 0 and not busy)
-        self.pdf_zip_cancel.setEnabled(not busy)
+        for a in (a_rot, a_exp, a_zip, a_del, a_all):
+            a.setEnabled(not busy)
+        a_undo.setEnabled(not busy and bool(self._pdf_undo_stack))
+        a_zip.setToolTip("图片按图片工作台的方案压缩；PDF 只重编码内嵌图片，文字层不动")
+        chosen = menu.exec(pos)
+        if chosen is None:
+            return
+        if chosen is a_rot:
+            self._pdf_rotate(uids)
+        elif chosen is a_exp:
+            self._pdf_extract(uids)
+        elif chosen is a_zip:
+            self._pdf_begin_compress(uids)
+        elif chosen is a_del:
+            self._pdf_delete_selected(uids)
+        elif chosen is a_all:
+            self.pdf_grid.select_all_items()
+        elif chosen is a_undo:
+            self._pdf_undo()
 
-    def _pdf_zip_on_quality(self, v: int) -> None:
-        self.pdf_zip_qv.setText(str(v))
-        # 质量一变，之前压好的暂存文件就作废了 —— 留着会让导出用上
-        # 旧质量的图片，用户完全看不出来
-        if self._pdf_staged:
-            self._pdf_drop_staged()
-            self.pdf_zip_hint.setText("质量变了，之前的压缩结果已作废，请重新压缩")
-        self._pdf_zip_timer.start()
+    # ---------------------------------------------------------- 撤销
+    def _pdf_snapshot(self) -> tuple:
+        """整队快照。原始文件从不删除，撤销只要把指针换回来。"""
+        rows = tuple(
+            (
+                it.uid, it.ref.src, it.ref.kind, it.ref.index, it.ref.rotate,
+                it.label, it.w, it.h, it.size, it.staged,
+                it.origin_src, it.origin_kind, it.thumb_png,
+            )
+            for it in self.pdf_items
+        )
+        return rows, dict(self._pdf_staged)
 
-    # ------------------------------------------------------------ 压缩：估算
+    def _pdf_push_undo(self) -> None:
+        self._pdf_undo_stack.append(self._pdf_snapshot())
+        if len(self._pdf_undo_stack) > 40:
+            self._pdf_undo_stack.pop(0)
+
+    def _pdf_undo(self) -> None:
+        if self._busy() or not self._pdf_undo_stack:
+            return
+        rows, staged = self._pdf_undo_stack.pop()
+        items: list[PdfItem] = []
+        for (
+            uid, src, kind, index, rot, label, w, h,
+            size, staged_path, origin_src, origin_kind, png,
+        ) in rows:
+            items.append(
+                PdfItem(
+                    uid=uid,
+                    ref=PageRef(src, kind, index, rot),
+                    label=label, w=w, h=h, thumb_png=png,
+                    size=size, staged=staged_path,
+                    origin_src=origin_src, origin_kind=origin_kind,
+                )
+            )
+        self.pdf_items = items
+        self.pdf_by_uid = {it.uid: it for it in items}
+        self._pdf_staged = dict(staged)
+        self._pdf_zip_close()
+        self._pdf_rebuild_grid()
+        self._pdf_on_selection()
+
+    # ---------------------------------------------------------- 压缩：打开
+    def _pdf_begin_compress(self, uids: list) -> None:
+        if self._busy() or not uids:
+            return
+        keep = set(uids)
+        self._pdf_compress_uids = [uid for uid in keep if uid in self.pdf_by_uid]
+        if not self._pdf_compress_uids:
+            return
+        # 同一批 uid 的顺序按队列走，确认后的临时文件编号才稳定
+        order = {it.uid: i for i, it in enumerate(self.pdf_items)}
+        self._pdf_compress_uids.sort(key=lambda u: order.get(u, 1 << 30))
+        # 重新点「压缩选中」= 再给失败的页一次机会；拖滑块不重试
+        for it in self._pdf_zip_targets():
+            eff = self._pdf_effective_ref(it)
+            self._pdf_est_failed.discard((eff.src, eff.index))
+        self.pdf_zip_panel.setVisible(True)
+        self.pdf_zip_hint.setText(
+            f"选中 {len(self._pdf_compress_uids)} 项 · 调整质量后点「确认压缩」"
+            "（大图估算可能要几秒）"
+        )
+        self._pdf_zip_refresh_estimate()
+        self._pdf_zip_estimate()
+
+    def _pdf_zip_close(self) -> None:
+        self._pdf_compress_uids = []
+        self._pdf_pair_cache = {}
+        self.pdf_zip_panel.setVisible(False)
+        self._pdf_zip_stop_estimate()
+        self._pdf_repaint_subs()
+
+    # ---------------------------------------------------------- 压缩：预估
     def _pdf_zip_targets(self) -> list[PdfItem]:
-        """当前该显示预估的页面。压缩部分只看选中的几页。"""
-        if self._pdf_zip_mode == "part":
-            uids = set(self.pdf_grid.selected_uids())
-            return [it for it in self.pdf_items if it.uid in uids]
-        return list(self.pdf_items)
+        return [
+            self.pdf_by_uid[uid] for uid in self._pdf_compress_uids
+            if uid in self.pdf_by_uid
+        ]
 
+    def _pdf_effective_ref(self, it: PdfItem) -> PageRef:
+        """当前该拿哪一页去压缩/估算。
+
+        - 图片：压缩后 ref.src 已换成暂存图，直接就是上一轮的结果；
+        - PDF 页：ref 永远指向原始文件，但压过的页在 _pdf_staged 里有单页
+          暂存件。再次压缩要从它读，不然每次都退回原始、质量叠不上去。
+          暂存单页的旋转已烘焙进去、页码恒为 0，所以用 (staged, pdf, 0, 0)。
+        """
+        if it.ref.kind == "pdf":
+            key = (it.ref.src, it.ref.index, it.ref.rotate % 360)
+            staged = self._pdf_staged.get(key)
+            if staged and Path(staged).exists():
+                return PageRef(staged, "pdf", 0, 0)
+        return it.ref
+
+    def _pdf_is_compressed(self, it: PdfItem) -> bool:
+        """这页有没有压过 —— 决定右上角「已压缩」绿标显示与否。"""
+        if it.staged and Path(it.staged).exists():
+            return True
+        if it.ref.kind == "pdf":
+            key = (it.ref.src, it.ref.index, it.ref.rotate % 360)
+            path = self._pdf_staged.get(key)
+            return bool(path and Path(path).exists())
+        return False
+
+    def _pdf_image_settings(self, quality: int | None = None) -> ImageSettings:
+        """PDF 里压图片时，照搬图片工作台当前那一套方案。
+
+        用户刚在图片页调好格式和质量，转头到 PDF 页压缩却换一套默认值，
+        是很容易让人以为是 bug 的。所以这里只读同一批控件。
+        """
+        side = self.img_side_chips.value() or "0"
+        try:
+            max_side = int(side)
+        except ValueError:
+            max_side = 0
+        return ImageSettings(
+            fmt=self.img_fmt_chips.value() or "keep",
+            quality=self.pdf_zip_quality.value() if quality is None else quality,
+            max_side=max_side,
+            strip_meta=(self.img_meta_chips.value() or "keep") == "strip",
+        )
+
+    def _pdf_sub_of(self, it: PdfItem) -> tuple[str, str]:
+        """每格下面那行字。压缩预览时是「88kb→66kb」，平时是体积 / pdf文件。"""
+        if it.uid in self._pdf_compress_uids:
+            pair = self._pdf_pair_cache.get(it.uid)
+            if pair:
+                # 「本页无图片」「估算失败」不是体积数字，用暗色，别冒充成功
+                return pair, "ok" if "→" in pair else "dim"
+            return "估算中…", "dim"
+        if it.staged:
+            if it.ref.kind == "image":
+                try:
+                    new = Path(it.staged).stat().st_size
+                except OSError:
+                    new = 0
+                return "已压缩 " + _pair_text(it.size, new), "ok"
+            return "已压缩 · 导出时生效", "ok"
+        if it.ref.kind == "image":
+            return _fmt_bytes(it.size), "dim"
+        return "pdf文件", "dim"
+
+    def _pdf_repaint_subs(self) -> None:
+        for it in self.pdf_items:
+            text, tone = self._pdf_sub_of(it)
+            self.pdf_grid.set_sub(it.uid, text, tone)
+            self.pdf_grid.set_badge(
+                it.uid, "已压缩" if self._pdf_is_compressed(it) else ""
+            )
+
+    def _pdf_zip_refresh_estimate(self) -> None:
+        """拖动质量条就更新 —— 图片真编码取样，PDF 页按比例缩放缓存值。
+
+        以前 est=0 一律写「估算中…」，于是纯文字页（根本没有图片可压）
+        会永远挂在那行字上，看起来像估算卡死。现在把「无图片」「失败」
+        「还在算」三种状态分开写清楚。
+        """
+        if not self._pdf_compress_uids:
+            return
+        q = self.pdf_zip_quality.value()
+        self.pdf_zip_qv.setText(str(q))
+        cur_sum = est_sum = 0
+        no_image = pending = 0
+        for it in self._pdf_zip_targets():
+            key = (it.ref.src, it.ref.index)
+            st = self._pdf_stats.get(key) if it.ref.kind == "pdf" else None
+            if st is not None and not st.compressible:
+                # count=0：纯文字页，或者图片全被跳过规则挡住了。
+                # 这页压了也不会变，直接说明原因，不让它假装还在算。
+                no_image += 1
+                self._pdf_pair_cache[it.uid] = st.reason or "无图片可压"
+            else:
+                cur, est = self._pdf_quick_estimate(it, q)
+                if est:
+                    self._pdf_pair_cache[it.uid] = _pair_text(cur, est)
+                    cur_sum += cur
+                    est_sum += est
+                elif key in self._pdf_est_failed:
+                    self._pdf_pair_cache[it.uid] = "估算失败"
+                else:
+                    self._pdf_pair_cache[it.uid] = "估算中…"
+                    pending += 1
+            text, tone = self._pdf_sub_of(it)
+            self.pdf_grid.set_sub(it.uid, text, tone)
+
+        n = len(self._pdf_compress_uids)
+        extra = f" · {no_image} 页无图片" if no_image else ""
+        if cur_sum:
+            pct = (1 - est_sum / cur_sum) * 100
+            hint = (
+                f"选中 {n} 项 · {_fmt_bytes(cur_sum)} → {_fmt_bytes(est_sum)}"
+                f"（省 {max(0, pct):.0f}%）{extra}"
+            )
+            if pending:
+                hint += " · 其余估算中…"
+        elif no_image:
+            hint = f"选中 {n} 项 · {no_image} 页没有可压缩的图片，将保持原样"
+        elif pending:
+            hint = f"选中 {n} 项 · 正在估算…（大图可能要几秒）"
+        else:
+            hint = f"选中 {n} 项 · 调整质量后点「确认压缩」"
+        self.pdf_zip_hint.setText(hint)
+
+    def _pdf_quick_estimate(self, it: PdfItem, q: int) -> tuple[int, int]:
+        """轻量估算：图片真编一次到内存，PDF 页拿缓存按比例推。"""
+        eff = self._pdf_effective_ref(it)
+        if eff.kind == "image":
+            try:
+                info = self.img_cache.get(eff.src) or probe_image(Path(eff.src))
+                est = preview_compress_bytes(Path(eff.src), self._pdf_image_settings(q), info)
+                return Path(eff.src).stat().st_size, est
+            except Exception:
+                return it.size, 0
+
+        st = self._pdf_stats.get((eff.src, eff.index))
+        if st is None:
+            return 0, 0
+        cur = st.cur_bytes or 0
+        est = int((st.est_bytes or cur) * (q / 78.0) ** 1.7)
+        return cur, est
+
+    def _pdf_zip_on_quality(self, _v: int) -> None:
+        self._pdf_zip_refresh_estimate()
+        self.pdf_zip_timer.start()   # 松手后再做一次精确估算
+
+    # ---------------------------------------------------------- PDF 页：精确估算
     def _pdf_zip_stop_estimate(self) -> None:
         self._pdf_est_gen += 1
         if self._pdf_est_cancel is not None:
@@ -921,74 +1063,65 @@ class MainWindow(QMainWindow):
             self._pdf_est_cancel = None
         self._pdf_est_key = None
 
-    def _pdf_zip_clear_subs(self) -> None:
-        """把格子下面那行尺寸字擦掉。"""
-        for it in self.pdf_items:
-            self.pdf_grid.set_sub(it.uid, "")
-
-    def _pdf_zip_estimate(self) -> None:
-        """算每页"当前 → 预估"。真解码真编码，所以整个丢后台，逐页回填。
-
-        同一份 PDF 的多页合并成一次任务：pypdf 解析一份 80 页的文件要几百
-        毫秒，每页各来一遍纯属浪费。
-        """
-        mode = self._pdf_zip_mode
-        if mode not in ("all", "part"):
-            return
-        targets = [it for it in self._pdf_zip_targets() if it.ref.kind == "pdf"]
-        q = self.pdf_zip_quality.value()
-        key = (mode, q, tuple(it.uid for it in targets))
-        if key == self._pdf_est_key:
-            return
-        self._pdf_est_stop_and_restart()
-        self._pdf_est_key = key
-
-        # 图片条目没有"页面内嵌图片"，直接标一句，别让它空着像算漏了
-        for it in self.pdf_items:
-            if it.ref.kind != "pdf":
-                self.pdf_grid.set_sub(it.uid, "图片文件 · 不参与压缩", "dim")
-
-        groups: dict[str, list[PdfItem]] = {}
-        for it in targets:
-            groups.setdefault(it.ref.src, []).append(it)
-        if not groups:
-            self._pdf_zip_update_hint()
-            return
-
-        gen = self._pdf_est_gen
-        cancel = self._pdf_est_cancel
-        if self._pdf_est_pool is None:
-            # 单线程：估算本身是 CPU 活，多线程抢 GIL 只会更慢，
-            # 而且 pypdf 的 reader 缓存不适合并发访问
-            self._pdf_est_pool = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="pdfestimate"
-            )
-        for src, items in groups.items():
-            self._pdf_est_pool.submit(self._pdf_est_job, gen, src, items, q, cancel)
-        self._pdf_zip_update_hint()
-
     def _pdf_est_stop_and_restart(self) -> None:
-        """取消上一轮估算，换一张新的取消票。"""
         if self._pdf_est_cancel is not None:
             self._pdf_est_cancel.set()
         self._pdf_est_gen += 1
         self._pdf_est_cancel = threading.Event()
 
-    def _pdf_est_job(self, gen: int, src: str, items: list[PdfItem], quality: int, cancel) -> None:
-        # 先吃缓存：压缩部分模式下用户来回点选同一页太常见了，每点一次
-        # 都把整页图片重新解码一遍，界面会一顿一顿的
+    def _pdf_zip_estimate(self) -> None:
+        """PDF 页的 PageStat 后台算一次，之后拖质量条只做比例缩放。"""
+        if not self._pdf_compress_uids:
+            return
+        pages = []
+        for it in self._pdf_zip_targets():
+            eff = self._pdf_effective_ref(it)
+            if eff.kind != "pdf":
+                continue
+            if (eff.src, eff.index) in self._pdf_stats:
+                continue
+            if (eff.src, eff.index) in self._pdf_est_failed:
+                continue
+            pages.append((eff, it))
+        if not pages:
+            return
+        self._pdf_est_stop_and_restart()
+        gen = self._pdf_est_gen
+        cancel = self._pdf_est_cancel
+        if self._pdf_est_pool is None:
+            self._pdf_est_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pdfestimate"
+            )
+        groups: dict[str, list[tuple[PageRef, PdfItem]]] = {}
+        for eff, it in pages:
+            groups.setdefault(eff.src, []).append((eff, it))
+        for src, pairs in groups.items():
+            self._pdf_est_pool.submit(self._pdf_est_job, gen, src, pairs, 78, cancel)
+
+    def _pdf_est_job(self, gen: int, src: str, pairs: list, quality: int, cancel) -> None:
         todo: list[int] = []
-        for it in items:
-            hit = self._pdf_stat_cache.get((src, it.ref.index, quality))
+        seen: set[int] = set()
+        for eff, _it in pairs:
+            idx = eff.index
+            if idx in seen:
+                continue
+            seen.add(idx)
+            hit = self._pdf_stat_cache.get((src, idx, quality))
             if hit is not None:
-                self.emitter.pdf_stat_ready.emit(gen, src, it.ref.index, hit)
+                self.emitter.pdf_stat_ready.emit(gen, src, idx, hit)
             else:
-                todo.append(it.ref.index)
+                todo.append(idx)
         if not todo:
             return
         try:
             stats = estimate_pdf(src, quality, todo, cancel=cancel)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # 取消是用户主动收手，不算失败；其余异常必须回报，
+            # 否则 _pdf_stats 永远没有这一页，界面就永远写「估算中…」
+            if not cancel.is_set() and gen == self._pdf_est_gen:
+                msg = str(exc).strip() or type(exc).__name__
+                for idx in todo:
+                    self.emitter.pdf_stat_failed.emit(gen, src, idx, msg[:80])
             return
         for idx, st in stats.items():
             self._pdf_stat_cache[(src, idx, quality)] = st
@@ -999,99 +1132,127 @@ class MainWindow(QMainWindow):
     def _on_pdf_stat(self, gen: int, src: str, idx: int, st) -> None:
         if gen != self._pdf_est_gen:
             return
+        self._pdf_est_failed.discard((src, idx))
         self._pdf_stats[(src, idx)] = st
-        label = st.label()
-        tone = "ok" if st.estimated else "dim"
-        for it in self.pdf_items:
-            if it.ref.src == src and it.ref.index == idx:
-                self.pdf_grid.set_sub(it.uid, label, tone)
-        self._pdf_zip_update_hint()
+        if self._pdf_compress_uids:
+            self._pdf_zip_refresh_estimate()
 
-    def _pdf_zip_update_hint(self) -> None:
-        """提示行汇总当前预估：全部 12 页 · 图片 8.4 MB → 2.1 MB（省 75%）。"""
-        mode = self._pdf_zip_mode
-        if mode not in ("all", "part"):
+    def _on_pdf_stat_failed(self, gen: int, src: str, idx: int, msg: str) -> None:
+        if gen != self._pdf_est_gen:
             return
-        targets = [it for it in self._pdf_zip_targets() if it.ref.kind == "pdf"]
-        if not targets:
-            self.pdf_zip_hint.setText("队列里没有 PDF 页面可压缩")
-            return
-        done = sum(
-            1 for it in targets if (it.ref.src, it.ref.index) in self._pdf_stats
-        )
-        head = f"选中 {len(targets)} 页" if mode == "part" else f"全部 {len(targets)} 页"
-        if done < len(targets):
-            self.pdf_zip_hint.setText(f"{head} · 正在估算 {done}/{len(targets)}…")
-            return
-        cur, est = self._pdf_zip_totals(targets)
-        if not cur:
-            self.pdf_zip_hint.setText(f"{head} · 没有可压缩的图片")
-            return
-        pct = (1 - est / cur) * 100 if cur else 0
-        self.pdf_zip_hint.setText(
-            f"{head} · 图片 {_fmt_bytes(cur)} → {_fmt_bytes(est)}（省 {pct:.0f}%）"
-        )
+        self._pdf_est_failed.add((src, idx))
+        if self._pdf_compress_uids:
+            self._pdf_zip_refresh_estimate()
 
-    def _pdf_zip_totals(self, targets: list[PdfItem]) -> tuple[int, int]:
-        cur = est = 0
-        for it in targets:
-            st = self._pdf_stats.get((it.ref.src, it.ref.index))
-            if st is None:
-                continue
-            cur += st.cur_bytes
-            est += st.est_bytes or st.cur_bytes
-        return cur, est
-
-    # ------------------------------------------------------------ 压缩：执行
-    def _pdf_zip_compress_selected(self) -> None:
-        """压缩选中：立刻压、存临时文件，压完把压缩区收回未启用。"""
+    # ---------------------------------------------------------- 压缩：执行
+    def _pdf_zip_confirm(self) -> None:
+        """确认：PDF 页走 stage_page，图片走图片工作台同一套 ffmpeg 方案。"""
         if self._busy():
             return
-        items = [it for it in self._pdf_zip_targets() if it.ref.kind == "pdf"]
+        items = self._pdf_zip_targets()
         if not items:
-            QMessageBox.information(
-                self, "没有可压缩的页面", "选中的都是图片文件，压缩只作用于 PDF 页面里的图片。"
-            )
+            self._pdf_zip_close()
             return
-        quality = self.pdf_zip_quality.value()
-        stamp = time.strftime("%H%M%S")
-        out_dir = self._pdf_stage_root() / stamp
-        self._pdf_zip_results = []
+        # 纯文字页 / 图片全被跳过的页压了也不会变小，别给它造一份
+        # 和原件一模一样的暂存 PDF，让用户以为"点了却没压"。
+        todo: list = []
+        skipped = 0
+        for it in items:
+            eff = self._pdf_effective_ref(it)
+            if eff.kind == "image":
+                todo.append(it)
+                continue
+            st = self._pdf_stats.get((eff.src, eff.index))
+            if st is not None and not st.compressible:
+                skipped += 1
+                continue
+            todo.append(it)
+        if not todo:
+            QMessageBox.information(
+                self,
+                "没有可压缩的图片",
+                "选中的 PDF 页没有可压缩的图片：纯文字页，或图片都被跳过规则挡住了。"
+                "这些页保持原样，不需要压缩。",
+            )
+            self._pdf_zip_close()
+            return
+        items = todo
+        self._pdf_push_undo()
+
+        q = self.pdf_zip_quality.value()
+        # 每轮一个独立子目录，带轮次号：同一秒连压两次也不会撞名、覆盖上一轮
+        self._pdf_zip_round += 1
+        out_dir = self._pdf_stage_root() / f"{time.strftime('%H%M%S')}_r{self._pdf_zip_round:02d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        results: list[tuple[str, str, str, int]] = []
+        # 跟随图片工作台当前方案，和拖动质量条时的预估同源
+        s = self._pdf_image_settings(q)
+        fmt = s.fmt
 
         def work(progress):
             total = len(items)
+            ffmpeg = _find_tool("ffmpeg")
             for i, it in enumerate(items):
-                path = out_dir / f"p{i:04d}.pdf"
-                stage_page(it.ref, path, quality)
-                self._pdf_zip_results.append(
-                    ((it.ref.src, it.ref.index, it.ref.rotate % 360), path)
-                )
+                eff = self._pdf_effective_ref(it)
+                if eff.kind == "image":
+                    info = self.img_cache.get(eff.src) or probe_image(Path(eff.src))
+                    ext = fmt if fmt != "keep" else (info.fmt if info.fmt in ("jpg", "png", "webp") else "jpg")
+                    out = out_dir / f"i{i:04d}.{ext}"
+                    cmds, made, err = build_compress_steps(
+                        ffmpeg, Path(eff.src), s, info, out_path=out
+                    )
+                    if err:
+                        raise RuntimeError(err)
+                    for cmd in cmds:
+                        subprocess.run(cmd, check=True, capture_output=True)
+                    results.append(("image", it.uid, str(made), made.stat().st_size))
+                else:
+                    out = out_dir / f"p{i:04d}.pdf"
+                    stage_page(eff, out, q)
+                    results.append(("pdf", it.uid, str(out), out.stat().st_size))
                 progress(int((i + 1) / total * 100))
-            return f"已压缩 {total} 页，导出时生效"
+            note = f"已压缩 {total} 项"
+            if skipped:
+                note += f"，{skipped} 页无图片已跳过"
+            return note
 
+        self._pdf_zip_results = results
         self._pdf_kind = "zip"
         self._pdf_t0 = time.time()
         self._pdf_result = str(out_dir)
         self._set_running(True)
         self._set_progress(0)
-        self.current_label.setText(f"正在压缩 {len(items)} 页的图片…")
+        self.current_label.setText(f"正在压缩 {len(items)} 项…")
         self.pdf_runner.start(work, "zip")
 
     def _pdf_stage_root(self) -> Path:
+        """临时文件放软件目录里，退出时整目录删掉，绝不覆盖用户原图。"""
         if self._pdf_stage_dir is None:
-            self._pdf_stage_dir = Path(tempfile.mkdtemp(prefix="zzbox_pdf_zip_"))
+            if getattr(sys, "frozen", False):
+                base = Path(sys.executable).resolve().parent
+            else:
+                base = Path(__file__).resolve().parents[2]
+            try:
+                self._pdf_stage_dir = Path(tempfile.mkdtemp(prefix="zzbox_pdf_", dir=base))
+            except OSError:
+                self._pdf_stage_dir = Path(tempfile.mkdtemp(prefix="zzbox_pdf_"))
         return self._pdf_stage_dir
 
     def _pdf_drop_staged(self) -> None:
-        """丢掉暂存的压缩页。质量变了、队列清空、程序退出时都要调。"""
+        """丢掉暂存：退出、清空时都走这里。"""
         self._pdf_staged.clear()
+        self._pdf_pair_cache = {}
         if self._pdf_stage_dir is not None:
             shutil.rmtree(self._pdf_stage_dir, ignore_errors=True)
             self._pdf_stage_dir = None
         for it in self.pdf_items:
-            if it.ref.kind == "pdf" and self._pdf_zip_mode in ("all", "part"):
-                continue
-            self.pdf_grid.set_sub(it.uid, "")
+            if it.staged and it.ref.kind == "image" and Path(it.staged).exists():
+                it.ref.src = it.origin_src or it.ref.src
+                it.ref.kind = it.origin_kind or it.ref.kind
+            it.staged = ""
+            it.origin_src = ""
+            it.origin_kind = ""
+        self._pdf_repaint_subs()
 
     # ------------------------------------------------------------ PDF 导入
     def _pdf_pick(self) -> None:
@@ -1139,6 +1300,7 @@ class MainWindow(QMainWindow):
                 bad.append(f"{p.name}（不支持这种格式）")
 
         if added:
+            self._pdf_push_undo()
             self.pdf_items.extend(added)
             self._pdf_rebuild_grid()
             self._pdf_start_thumbs(added)
@@ -1157,7 +1319,13 @@ class MainWindow(QMainWindow):
     def _pdf_new_item(self, path: Path, kind: str, index: int, info) -> PdfItem:
         self._pdf_seq += 1
         uid = f"p{self._pdf_seq}"
-        item = PdfItem(uid=uid, ref=PageRef(str(path), kind, index), origin=path.name)
+        try:
+            size = path.stat().st_size if kind == "image" else 0
+        except OSError:
+            size = 0
+        item = PdfItem(
+            uid=uid, ref=PageRef(str(path), kind, index), origin=path.name, size=size
+        )
         if kind == "pdf" and info is not None and index < len(info.sizes):
             item.w, item.h = info.sizes[index]
             item.label = f"第 {index + 1} 页 · {path.stem}"
@@ -1187,24 +1355,6 @@ class MainWindow(QMainWindow):
                 self.pdf_grid.set_thumb(it.uid, it.thumb_png)
         self._pdf_repaint_labels()
         self._pdf_repaint_subs()
-
-    def _pdf_repaint_subs(self) -> None:
-        """重建格子会把 item 的 data 全清掉，尺寸行得补回来。
-
-        压缩部分模式不补：它只显示选中页的数字，而重建之后选中是空的 ——
-        补出来的会是"上一位用户的选中"，等 selection 回调再算一遍才对。
-        """
-        mode = getattr(self, "_pdf_zip_mode", "off")
-        for it in self.pdf_items:
-            if self._pdf_staged.get((it.ref.src, it.ref.index, it.ref.rotate % 360)):
-                self.pdf_grid.set_sub(it.uid, "已压缩 · 导出时生效", "ok")
-                continue
-            if mode == "all" and it.ref.kind == "pdf":
-                st = self._pdf_stats.get((it.ref.src, it.ref.index))
-                if st is not None:
-                    self.pdf_grid.set_sub(
-                        it.uid, st.label(), "ok" if st.estimated else "dim"
-                    )
 
     def _pdf_label_of(self, it: PdfItem) -> str:
         if it.ref.rotate:
@@ -1246,32 +1396,24 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ PDF 队列
     def _pdf_on_reorder(self, uids: list) -> None:
+        self._pdf_push_undo()
         order = {uid: i for i, uid in enumerate(uids)}
         self.pdf_items.sort(key=lambda it: order.get(it.uid, 1 << 30))
         self._pdf_refresh()
 
     def _pdf_on_selection(self) -> None:
-        n = len(self.pdf_grid.selected_uids())
-        busy = self._busy()
-        self.pdf_btn_rotate.setEnabled(bool(n) and not busy)
-        self.pdf_btn_extract.setEnabled(bool(n) and not busy)
-        self.pdf_btn_del.setEnabled(bool(n) and not busy)
         self._pdf_refresh()
-        # 压缩部分只给选中的页面算预估，选中变了就得重算一遍；
-        # 压缩全部不受选中影响，不用跟着抖
-        if getattr(self, "_pdf_zip_mode", "off") == "part":
-            self._pdf_zip_clear_subs()
-            self._pdf_zip_estimate()
 
     def _pdf_select_all(self) -> None:
         self.pdf_grid.select_all_items()
 
-    def _pdf_delete_selected(self) -> None:
+    def _pdf_delete_selected(self, uids: list | None = None) -> None:
         if self._busy():
             return
-        drop = set(self.pdf_grid.selected_uids())
+        drop = set(uids if uids is not None else self.pdf_grid.selected_uids())
         if not drop:
             return
+        self._pdf_push_undo()
         self.pdf_items = [it for it in self.pdf_items if it.uid not in drop]
         for uid in drop:
             self.pdf_by_uid.pop(uid, None)
@@ -1282,6 +1424,8 @@ class MainWindow(QMainWindow):
     def _pdf_clear(self) -> None:
         if self._busy():
             return
+        if self.pdf_items:
+            self._pdf_push_undo()
         self.pdf_items.clear()
         self.pdf_by_uid.clear()
         self._pdf_thumb_jobs = 0
@@ -1290,7 +1434,7 @@ class MainWindow(QMainWindow):
         self._pdf_stats.clear()
         self._pdf_stat_cache.clear()
         self._pdf_drop_staged()
-        self._pdf_zip_set("off")
+        self._pdf_zip_close()
         self._pdf_rebuild_grid()
         self._pdf_on_selection()
 
@@ -1311,23 +1455,17 @@ class MainWindow(QMainWindow):
         busy = self._busy()
         self.pdf_btn_all.setEnabled(bool(n) and not busy)
         self.pdf_btn_clear.setEnabled(bool(n) and not busy)
-        if not n:
-            for b in (
-                self.pdf_btn_rotate,
-                self.pdf_btn_extract,
-                self.pdf_btn_del,
-            ):
-                b.setEnabled(False)
-        if hasattr(self, "pdf_zip_enable"):
-            self._pdf_zip_refresh()
+        if hasattr(self, "pdf_zip_run"):
+            self.pdf_zip_run.setEnabled(bool(n) and not busy)
         if self._page == 2:
             self._update_start_text()
             self._sync_tray()
 
-    def _pdf_rotate(self) -> None:
-        uids = self.pdf_grid.selected_uids()
+    def _pdf_rotate(self, uids: list | None = None) -> None:
+        uids = list(uids) if uids is not None else self.pdf_grid.selected_uids()
         if not uids:
             return
+        self._pdf_push_undo()
         for uid in uids:
             it = self.pdf_by_uid.get(uid)
             if it is None:
@@ -1360,9 +1498,12 @@ class MainWindow(QMainWindow):
         return Path.home()
 
     # ------------------------------------------------------------ PDF 导出
-    def _pdf_extract(self) -> None:
+    def _pdf_extract(self, uids: list | None = None) -> None:
         """导出选中：无损搬运，文字层和链接都留着。"""
-        refs = self._pdf_target_refs(only_selected=True)
+        if uids is None:
+            refs = self._pdf_target_refs(only_selected=True)
+        else:
+            refs = [self.pdf_by_uid[u].ref for u in uids if u in self.pdf_by_uid]
         if not refs:
             return
         menu = QMenu(self)
@@ -1372,7 +1513,7 @@ class MainWindow(QMainWindow):
         act_png = menu.addAction("导出为 PNG 图片")
         act_jpg = menu.addAction("导出为 JPG 图片")
         act_one.setToolTip("不重新渲染，文字层、链接、表单原样保留")
-        chosen = menu.exec(self.pdf_btn_extract.mapToGlobal(self.pdf_btn_extract.rect().bottomLeft()))
+        chosen = menu.exec(QCursor.pos())
         if chosen is None:
             return
         if chosen is act_png:
@@ -1468,8 +1609,6 @@ class MainWindow(QMainWindow):
         两种情况：压缩全部开着（导出时才真压），或者有部分页已经压好暂存了
         （那些页必须用暂存文件，否则用户的"压缩选中"白点了）。
         """
-        if getattr(self, "_pdf_zip_mode", "off") == "all":
-            return True
         return any(Path(p).exists() for p in self._pdf_staged.values())
 
     def _pdf_start_zip(self, jobs: list[tuple[list[PageRef], Path]], label: str) -> None:
@@ -1479,7 +1618,8 @@ class MainWindow(QMainWindow):
         对象的 API，压缩只能换另一条路。代价是 pypdf 写文件比 pdfium 慢，
         换来的是文字层和页面尺寸一个字节都不动。
         """
-        quality = self.pdf_zip_quality.value() if self._pdf_zip_mode == "all" else None
+        # 页面级压缩已经在「确认压缩」时做完并存成暂存页，这里只负责合并
+        quality = None
         staged = dict(self._pdf_staged)
         total = max(1, len(jobs))
 
@@ -1580,20 +1720,40 @@ class MainWindow(QMainWindow):
         secs = time.time() - self._pdf_t0 if self._pdf_t0 else 0.0
         verb = {"image": "导出图片", "zip": "压缩"}.get(kind, "导出")
 
-        if ok and kind == "zip":
-            # 部分压缩完成：把临时文件登记进暂存表，压缩区收回未启用。
-            # 之后的导出直接拿这些文件用，不再重算
-            for key, path in self._pdf_zip_results:
-                self._pdf_staged[key] = str(path)
-            count = len(self._pdf_zip_results)
+        if kind == "zip":
+            # 压缩完成：PDF 页登记进暂存表；图片直接把队列指针换成临时文件。
+            # 两条路都不动用户的原始文件，Ctrl+Z 能原样换回来。
+            if ok:
+                for what, uid, path, _size in self._pdf_zip_results:
+                    it = self.pdf_by_uid.get(uid)
+                    if it is None:
+                        continue
+                    if what == "image":
+                        it.origin_src = it.origin_src or it.ref.src
+                        it.origin_kind = it.origin_kind or it.ref.kind
+                        it.ref.src = path
+                        it.staged = path
+                        it.thumb_png = b""
+                        it.thumbbed = False
+                        self._pdf_start_thumbs([it])
+                    else:
+                        # PDF 页：ref 仍指原始文件（页码/旋转/导出键都靠它），
+                        # 只把暂存件登记进字典 + it.staged，供角标和再次压缩用。
+                        key = (it.ref.src, it.ref.index, it.ref.rotate % 360)
+                        self._pdf_staged[key] = path
+                        it.staged = path
+                        # 缩略图重渲一次，反映压缩后的页面
+                        it.thumb_png = b""
+                        it.thumbbed = False
+                        self._pdf_start_thumbs([it])
+                count = len(self._pdf_zip_results)
+                self._set_progress(100)
+                self.current_label.setText(msg or f"已压缩 {count} 项")
+                self.stats_label.setText("压缩结果已换入队列，导出时直接使用")
+                if not self.isVisible() and self.tray:
+                    self.tray.notify("压缩完成", f"{count} 项已换入队列")
             self._pdf_zip_results = []
-            self._set_progress(100)
-            self.current_label.setText(f"已压缩 {count} 页")
-            self.stats_label.setText("压缩结果已暂存，导出时直接使用")
-            self._pdf_zip_set("off")
-            self._pdf_repaint_subs()
-            if not self.isVisible() and self.tray:
-                self.tray.notify("压缩完成", f"{count} 页已暂存")
+            self._pdf_zip_close()
             self._pdf_kind = ""
             self._pdf_on_selection()
             return
@@ -1685,6 +1845,8 @@ class MainWindow(QMainWindow):
         self.br_spin.setSuffix(" kbps")
         # QSpinBox 默认横向 Expanding，会和滑块一样被拉开；这里固定成够用的宽度
         self.br_spin.setFixedWidth(132)
+        # 码率模式下调这个数字，预估体积同样要跟着变
+        self.br_spin.valueChanged.connect(lambda _v: self._refresh_rows())
         br_row.addWidget(self.br_spin)
         br_row.addStretch(1)
         self._br_row = QWidget()
@@ -1742,33 +1904,33 @@ class MainWindow(QMainWindow):
             [("0", "关闭"), ("2", "2×"), ("3", "3×"), ("4", "4×")]
         )
         self.ai_scale_chips.set_value("2")
-        self.ai_scale_chips.changed.connect(lambda _k: self._refresh_ai())
+        self.ai_scale_chips.changed.connect(lambda _k: self._refresh_ai_rows())
 
         self.ai_model_chips = ChipGroup(
             [("photo", "真人实拍"), ("anime", "动画番剧")]
         )
         self.ai_model_chips.set_value(DEFAULT_MODEL)
-        self.ai_model_chips.changed.connect(lambda _k: self._refresh_ai())
+        self.ai_model_chips.changed.connect(lambda _k: self._refresh_ai_rows())
         for key, (_n, _sc, _label, note) in MODELS.items():
             self.ai_model_chips.button(key).setToolTip(note)
 
         self.ai_interp_chips = ChipGroup([("1", "关闭"), ("2", "2×"), ("4", "4×")])
         self.ai_interp_chips.set_value("1")
-        self.ai_interp_chips.changed.connect(lambda _k: self._refresh_ai())
+        self.ai_interp_chips.changed.connect(lambda _k: self._refresh_ai_rows())
         self.ai_interp_chips.button("2").setToolTip("帧率翻倍，时长不变，音轨原样保留")
 
         self.ai_enc_chips = ChipGroup(
             [("h264", "H.264"), ("hevc", "HEVC"), ("av1", "AV1")]
         )
         self.ai_enc_chips.set_value("hevc")
-        self.ai_enc_chips.changed.connect(lambda _k: self._refresh_ai())
+        self.ai_enc_chips.changed.connect(lambda _k: self._refresh_ai_rows())
 
         # 降噪 / 锐化：补模型短板的两个开关，挤在同一格里省一行
         self.ai_denoise_chips = ChipGroup(
             [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
         )
         self.ai_denoise_chips.set_value("0")
-        self.ai_denoise_chips.changed.connect(lambda _k: self._refresh_ai())
+        self.ai_denoise_chips.changed.connect(lambda _k: self._refresh_ai_rows())
         for k in ("0", "1", "2"):
             self.ai_denoise_chips.button(k).setToolTip(
                 "低码率视频先降噪再超分，避免把压缩块和振铃一起放大 4 倍\n"
@@ -1778,7 +1940,7 @@ class MainWindow(QMainWindow):
             [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
         )
         self.ai_sharpen_chips.set_value("1")
-        self.ai_sharpen_chips.changed.connect(lambda _k: self._refresh_ai())
+        self.ai_sharpen_chips.changed.connect(lambda _k: self._refresh_ai_rows())
         for k in ("0", "1", "2"):
             self.ai_sharpen_chips.button(k).setToolTip(
                 "4× 重建后降到目标尺寸，边缘会软一档，补一点 unsharp 拉回来\n"
@@ -1954,7 +2116,7 @@ class MainWindow(QMainWindow):
             [("keep", "保持原样"), ("jpg", "JPG"), ("png", "PNG"), ("webp", "WebP")]
         )
         self.img_fmt_chips.set_value("keep")
-        self.img_fmt_chips.changed.connect(lambda _k: self._refresh_img())
+        self.img_fmt_chips.changed.connect(lambda _k: self._img_refresh_rows())
         self.img_fmt_chips.button("keep").setToolTip("跟随每张图自己的格式，只改质量和尺寸")
         self.img_fmt_chips.button("jpg").setToolTip("通用性最好，不支持透明")
         self.img_fmt_chips.button("png").setToolTip("无损，体积最大，支持透明")
@@ -1973,16 +2135,17 @@ class MainWindow(QMainWindow):
             stretch=False,
         )
         self.img_side_chips.set_value("0")
-        self.img_side_chips.changed.connect(lambda _k: self._refresh_img())
+        self.img_side_chips.changed.connect(lambda _k: self._img_refresh_rows())
         self.img_side_input = QLineEdit()
         self.img_side_input.setPlaceholderText("像素")
         self.img_side_input.setFixedWidth(64)
         self.img_side_input.setToolTip("自定义长边像素，只缩不放")
-        self.img_side_input.textChanged.connect(lambda _t: self._refresh_img())
+        # 自定义长边也必须重算表格里的「预计导出大小」，不能只刷面板说明
+        self.img_side_input.textChanged.connect(lambda _t: self._img_refresh_rows())
 
         self.img_meta_chips = ChipGroup([("keep", "保留"), ("strip", "清除")])
         self.img_meta_chips.set_value("keep")
-        self.img_meta_chips.changed.connect(lambda _k: self._refresh_img())
+        self.img_meta_chips.changed.connect(lambda _k: self._img_refresh_rows())
         self.img_meta_chips.button("strip").setToolTip(
             "去掉 EXIF、拍摄时间、GPS 和相机型号 —— 发图前建议清掉"
         )
@@ -1998,7 +2161,7 @@ class MainWindow(QMainWindow):
 
     def _on_img_quality(self, v: int) -> None:
         self.img_quality_value.setText(str(v))
-        self._refresh_img()
+        self._img_refresh_rows()
 
     def _img_quality_row(self) -> QWidget:
         row = QHBoxLayout()
@@ -2029,13 +2192,13 @@ class MainWindow(QMainWindow):
             [("0", "关闭"), ("2", "2×"), ("3", "3×"), ("4", "4×")]
         )
         self.img_ai_scale.set_value("2")
-        self.img_ai_scale.changed.connect(lambda _k: self._refresh_img())
+        self.img_ai_scale.changed.connect(lambda _k: self._img_refresh_rows())
 
         self.img_ai_model = ChipGroup(
             [("photo", "真人实拍"), ("anime", "动画番剧")]
         )
         self.img_ai_model.set_value(DEFAULT_MODEL)
-        self.img_ai_model.changed.connect(lambda _k: self._refresh_img())
+        self.img_ai_model.changed.connect(lambda _k: self._img_refresh_rows())
         for key, (_n, _sc, _label, note) in MODELS.items():
             self.img_ai_model.button(key).setToolTip(note)
 
@@ -2043,19 +2206,19 @@ class MainWindow(QMainWindow):
             [("keep", "跟随源"), ("png", "PNG"), ("jpg", "JPG"), ("webp", "WebP")]
         )
         self.img_ai_fmt.set_value("keep")
-        self.img_ai_fmt.changed.connect(lambda _k: self._refresh_img())
+        self.img_ai_fmt.changed.connect(lambda _k: self._img_refresh_rows())
         self.img_ai_fmt.button("png").setToolTip("超分细节最完整的落盘格式，体积也最大")
 
         self.img_ai_denoise = ChipGroup(
             [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
         )
         self.img_ai_denoise.set_value("0")
-        self.img_ai_denoise.changed.connect(lambda _k: self._refresh_img())
+        self.img_ai_denoise.changed.connect(lambda _k: self._img_refresh_rows())
         self.img_ai_sharpen = ChipGroup(
             [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
         )
         self.img_ai_sharpen.set_value("1")
-        self.img_ai_sharpen.changed.connect(lambda _k: self._refresh_img())
+        self.img_ai_sharpen.changed.connect(lambda _k: self._img_refresh_rows())
 
         panel.add("倍率", self.img_ai_scale)
         panel.add("模型", self.img_ai_model)
@@ -2825,15 +2988,20 @@ class MainWindow(QMainWindow):
         is_crf = key == "crf"
         self._crf_row.setVisible(is_crf)
         self._br_row.setVisible(not is_crf)
-        if is_crf:
-            self.crf_hint.setText(self._crf_hint_text(self.crf_slider.value()))
-        else:
-            self.crf_hint.setText("目标码率 · 1080p 建议 4000~8000 kbps，数值越大越清晰")
+        # 这里原来往 self.crf_hint 写说明文字，但那个控件根本不存在 ——
+        # 每次切模式/拖 CRF 都抛 AttributeError，被 Qt 吞掉，于是后面的
+        # _refresh_rows() 从来没执行过：队列里的「预计导出大小」纹丝不动。
+        # 说明文字挂到滑块 tooltip 上，该做的重算照做。
+        self.crf_slider.setToolTip(
+            self._crf_hint_text(self.crf_slider.value())
+            if is_crf
+            else "目标码率 · 1080p 建议 4000~8000 kbps，数值越大越清晰"
+        )
         self._refresh_rows()
 
     def _on_crf_changed(self, v: int) -> None:
         self.crf_value.setText(str(v))
-        self.crf_hint.setText(self._crf_hint_text(v))
+        self.crf_slider.setToolTip(self._crf_hint_text(v))
         self._refresh_rows()
 
     @staticmethod
@@ -3014,6 +3182,16 @@ class MainWindow(QMainWindow):
         need = estimate_temp_bytes(m, s, inf, (tw, th))
         self._show_temp_alert(m, s, need, plan_warnings(m, s, profile))
 
+    def _refresh_ai_rows(self) -> None:
+        """AI 参数一变，队列里每行的「导出格式 / 预计大小」都要跟着重算。
+
+        只刷右侧面板不够 —— 用户改倍率时盯的是队列里那一列数字。之前这里
+        接的是 `_refresh_ai()`，于是面板说明变了、表格数字纹丝不动。
+        """
+        for path in self.files:
+            self._paint_row(path)
+        self._refresh_ai()
+
     def _show_temp_alert(
         self, m: MediaInfo, s: AiSettings, need: int, warns: list[str]
     ) -> None:
@@ -3140,13 +3318,7 @@ class MainWindow(QMainWindow):
             self.img_ai_sharpen,
             self.pdf_btn_add,
             self.pdf_btn_all,
-            self.pdf_btn_del,
             self.pdf_btn_clear,
-            self.pdf_btn_rotate,
-            self.pdf_btn_extract,
-            self.pdf_zip_enable,
-            self.pdf_zip_all,
-            self.pdf_zip_part,
             self.pdf_zip_run,
             self.pdf_zip_cancel,
             self.pdf_zip_quality,
@@ -3175,9 +3347,49 @@ class MainWindow(QMainWindow):
             0, 0, int(width * self._progress_pct / 100), self.progress.height()
         )
 
+    def _set_stage_marks(self, bounds: list[float]) -> None:
+        """在进度条上画出阶段分界。
+
+        bounds 是各阶段结束位置占全长的比例（不含最后一段的 1.0）。
+        「先 4× 推理再降采样到 2×」这种要分两步走的事，靠这条竖线切成两段，
+        用户一眼就能看出当前在 4× 那段还是已经进了降采样那段。
+        """
+        for w in self._prog_marks:
+            w.deleteLater()
+        self._prog_marks = []
+        self._stage_bounds = list(bounds)
+        width, height = self.progress.width(), self.progress.height()
+        if not bounds or width <= 0:
+            return
+        for frac in bounds:
+            x = int(width * frac)
+            if not (2 < x < width - 2):
+                continue
+            mark = QLabel(self.progress)
+            mark.setStyleSheet("background:rgba(255,255,255,0.55); border-radius:0;")
+            mark.setGeometry(x - 1, 0, 2, height)
+            mark.show()
+            self._prog_marks.append(mark)
+
+    def _sync_stage_marks(self, plan) -> None:
+        stages = getattr(plan, "stages", None) or []
+        total = sum(s.weight for s in stages) or 1.0
+        cum, bounds = 0.0, []
+        for st in stages[:-1]:
+            cum += st.weight
+            bounds.append(cum / total)
+        self._set_stage_marks(bounds)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        QTimer.singleShot(0, lambda: self._set_progress(self._progress_pct))
+        QTimer.singleShot(0, self._relayout_bar)
+
+    def _relayout_bar(self) -> None:
+        """窗口缩放后重画进度条与阶段刻度（刻度是按像素算的，得跟着重排）。"""
+        bounds = list(self._stage_bounds)
+        self._set_progress(self._progress_pct)
+        if bounds:
+            self._set_stage_marks(bounds)
 
     def _start(self) -> None:
         if self._page == 2:
@@ -3903,6 +4115,10 @@ class MainWindow(QMainWindow):
 
     def _on_ai_stage(self, index: int, label: str) -> None:
         self._ai_stage_name = label
+        # 阶段名里已经写明「超分 4× → 2×」，进度条上再按权重切出分界
+        plan = (self._ai_cur or {}).get("plan")
+        if plan is not None:
+            self._sync_stage_marks(plan)
         if 0 <= self._index < len(self.files):
             st = self._state(self.files[self._index])
             st.status = f"{label}…"

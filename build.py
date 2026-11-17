@@ -178,11 +178,19 @@ def main() -> int:
             if f.is_file():
                 shutil.copy2(f, dst_lic / f.name)
 
-    # 旧版本改名挪走（不删除），新版本就位
+    # 旧版本改名挪走（不删除），新版本就位。
+    # 如果 DIST 正被资源管理器 / 预览面板占着，rename 会失败 —— 这时不删旧目录，
+    # 直接原位覆盖同名文件，免得为了打个包还得让用户去关窗口。
     DIST.parent.mkdir(parents=True, exist_ok=True)
     if DIST.exists():
-        _park(DIST)
-    shutil.copytree(built, DIST)
+        try:
+            _park(DIST)
+            print("  旧版本已挪走，复制新版本就位")
+        except OSError as exc:
+            print(f"  旧目录被占用，改为原位覆盖（不删除旧文件）：{exc}")
+    # 无论旧目录是挪走、本来就不存在、还是被占用，最后都要把新版本复制到位。
+    # 之前 _park 成功后漏了这一步，导致成品目录空掉。
+    shutil.copytree(built, DIST, dirs_exist_ok=True)
 
     total = sum(f.stat().st_size for f in DIST.rglob("*") if f.is_file())
     exe = DIST / f"{APP_NAME}.exe"

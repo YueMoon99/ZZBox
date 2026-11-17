@@ -296,10 +296,6 @@ def plan_warnings(
             f"{px / limit:.1f} 倍，可能因显存不足失败或明显变慢"
         )
 
-    # 4K 之上多数播放器、剪辑软件和平台都吃不下，说一句而不是偷偷裁掉
-    if oh > 2160:
-        out.append(f"输出 {ow}×{oh} 超过 4K，多数播放器与平台吃不下")
-
     if s.has_upscale and ow <= _even(media.width):
         out.append("输出尺寸没有超过源文件，这次超分不会带来更大画面")
 
@@ -596,18 +592,19 @@ def build_plan(
             f"{uw0}×{uh0} 超出 {profile.tier}档显存建议范围，已改用 {tile}px 分块处理，耗时会明显增加"
         )
 
-    # ---- 权重：按各阶段的实测耗时占比分配，越靠后的阶段占比越大
+    # 权重：按各阶段的实测耗时占比分配，越靠后的阶段占比越大
     w_split, w_sr, w_fps, w_mux, w_mid = 0.06, 0.0, 0.0, 0.22, 0.0
-    # 推理尺寸比最终输出大时，补帧前要先降下来（见下面的 2.5 阶段）
-    need_mid = (
-        s.has_upscale and s.has_interp and (uw0, uh0) != (tw, th)
-    )
+    # 推理尺寸比最终输出大时，中间要插一道降采样把它缩回来。
+    # 这道工序必须**独立成一个阶段**：x4plus 只有 4× 一档，请求 2× 时引擎
+    # 仍按 4× 推理，进度条上会出现「超分 4×」——不把后面这道「降采样」也画
+    # 出来，用户会以为设置没生效、拿到的还是 4× 的片子。
+    need_mid = s.has_upscale and (uw0, uh0) != (tw, th)
     if need_mid:
-        w_mid = 0.05
+        w_mid = 0.10
     if s.has_upscale and s.has_interp:
         w_sr, w_fps = 0.55 - w_mid, 0.17
     elif s.has_upscale:
-        w_sr = 0.72
+        w_sr = 0.72 - w_mid
     else:
         w_fps = 0.72
 
@@ -658,9 +655,15 @@ def build_plan(
             "-m", str(Path(engine.exe).parent / "models"),
             "-f", "png", "-g", "0",
         ]  # fmt: skip
+        # 标签写成「超分 4× → 2×」而不是「超分 4×」：x4plus 只有 4× 一档，
+        # 请求 2× 时引擎确实按 4× 推理，但最终产物是 2×。只写 4× 会让用户
+        # 以为设置没生效；只写 2× 又瞒掉了实际算力消耗。两个都写。
+        sr_label = (
+            f"超分 {inf}× → {s.scale}×" if inf > s.scale else f"超分 {inf}×"
+        )
         plan.stages.append(
             Stage(
-                label=f"超分 {inf}×",
+                label=sr_label,
                 cmd=cmd,
                 kind="count",
                 weight=w_sr,
@@ -670,17 +673,18 @@ def build_plan(
         )
         cur_input = up
 
-    # ---- 2.5 补帧前先降到目标尺寸
-    # 推理按 4× 走（720p→2880p），但最终只要 1440p。如果直接在这个尺寸上补帧：
-    #   · RIFE 的耗时与像素数成正比，2880p 是 1440p 的 4 倍
-    #   · 中间帧在 2880p 上生成再缩小，边缘反而不如直接在小尺寸上插
-    # 先降再补，两个问题一起解决。只补帧不超分时不存在这一步。
+    # ---- 2.5 降到目标尺寸
+    # 推理按 4× 走（720p→2880p），最终只要 2×（1440p）。这一步必须单列：
+    #   · 只超分不补帧时，缩放原本藏在合成的 -vf 里，进度条上根本看不见，
+    #     用户看到「超分 4×」会以为拿到的也是 4×；
+    #   · 要补帧时，2880p 上补帧是 1440p 的 4 倍耗时，中间帧质量还更差。
+    # 先降再补，两个问题一起解决。
     if need_mid:
         mid = work_dir / "mid"
         mid.mkdir(exist_ok=True)
         plan.stages.append(
             Stage(
-                label="降采样",
+                label=f"降采样 {inf}× → {s.scale}×",
                 cmd=[
                     ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
                     "-i", str(up / "%06d.png"),
@@ -737,7 +741,7 @@ def build_plan(
     # 不带宽高的 scale 就是纯粹的色彩空间转换。
     uw, uh = _even(media.width * inf), _even(media.height * inf)
     cm, cr = color_matrix(media), color_range(media)
-    if (tw, th) != (uw, uh):
+    if not need_mid and (tw, th) != (uw, uh):
         vf = f"scale={tw}:{th}:flags=lanczos:out_color_matrix={cm}:out_range={cr}"
     else:
         vf = f"scale=out_color_matrix={cm}:out_range={cr}"

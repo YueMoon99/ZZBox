@@ -135,21 +135,20 @@ def main() -> int:
     pump(app, 4)
     sel = win.pdf_grid.selected_uids()
     check("选中 2 格", len(sel) == 2, str(len(sel)))
-    check("旋转按钮可用", win.pdf_btn_rotate.isEnabled())
+    check("右键菜单信号可用", bool(win.pdf_grid.context_requested))
 
     before = win.pdf_by_uid[sel[0]].ref.rotate
-    win._pdf_rotate()
+    win._pdf_rotate(sel)
     pump(app, 6)
     after = win.pdf_by_uid[sel[0]].ref.rotate
     check("旋转 +90°", after == (before + 90) % 360, f"{before} → {after}")
     check("标签带角度", "90" in win.pdf_grid.item(0).text(), win.pdf_grid.item(0).text())
 
-    print("\n[5] 压缩区默认未启用")
-    check("只有「启用压缩功能」可见", win.pdf_zip_enable.isVisibleTo(win))
-    check("压缩全部/部分此刻不露出", not win.pdf_zip_all.isVisibleTo(win))
-    check("质量条此刻不露出", not win.pdf_zip_qwrap.isVisibleTo(win))
-    check("提示语说明未启用", "未启用" in win.pdf_zip_hint.text(), win.pdf_zip_hint.text())
-    check("状态机在 off", win._pdf_zip_mode == "off", win._pdf_zip_mode)
+    print("\n[5] 压缩条默认收起")
+    check("压缩条默认隐藏", win.pdf_zip_panel.isHidden())
+    check("质量条默认不露出", not win.pdf_zip_quality.isVisibleTo(win))
+    inside = {w.text() for w in win.pdf_zip_panel.findChildren(QPushButton)}
+    check("压缩条里没有旧入口", not ({"启用压缩功能", "压缩全部", "压缩部分"} & inside), str(sorted(inside)))
 
     print("\n[6] 拖动排序回读（走真实鼠标拖动）")
     uids = win.pdf_grid.ordered_uids()
@@ -181,26 +180,13 @@ def main() -> int:
     check("顺序跟着界面走", win.pdf_items[0].uid == uids[-1],
           f"{win.pdf_items[0].uid} vs {uids[-1]}")
 
-    print("\n[7] 下方工作区分区：左操作 / 右压缩")
-    ops = win.pdf_ops_panel
-    comp = win.pdf_zip_panel
-    ops_r, comp_r = ops.geometry(), comp.geometry()
-    share = ops_r.width() / max(1, ops_r.width() + comp_r.width())
-    check("左区比右区窄", ops_r.width() < comp_r.width(), f"{ops_r.width()}px vs {comp_r.width()}px")
-    check("左区占比 12%~26%", 0.12 <= share <= 0.26, f"{share:.0%}")
-    check("操作区在左边", ops_r.left() < comp_r.left(), f"{ops_r.left()} < {comp_r.left()}")
-    check("两区顶边对齐", abs(ops_r.top() - comp_r.top()) <= 1, f"{ops_r.top()} vs {comp_r.top()}")
-    check("两区等高", abs(ops_r.height() - comp_r.height()) <= 1, f"{ops_r.height()} vs {comp_r.height()}")
-    # 关键回归：旋转/导出绝对不能又回到压缩卡片里
-    inside = {w.text() for w in comp.findChildren(QPushButton)}
-    check("压缩区里没有「旋转选中」", "旋转选中" not in inside, str(sorted(inside)))
-    check("压缩区里没有「导出选中」", "导出选中" not in inside)
-    check("压缩区里是「启用压缩功能」", "启用压缩功能" in inside, str(sorted(inside)))
-    ops_btns = {w.text() for w in ops.findChildren(QPushButton)}
-    check("左区正好这两个按钮", ops_btns == {"旋转选中", "导出选中"}, str(sorted(ops_btns)))
-    for name, btn in (("旋转选中", win.pdf_btn_rotate), ("导出选中", win.pdf_btn_extract)):
-        check(f"按钮文案是「{name}」", btn.text() == name, btn.text())
-        check(f"「{name}」可见", btn.isVisible())
+    print("\n[7] 面板按钮收进右键菜单")
+    pdf_page = win.pages.widget(2)
+    all_btns = {w.text() for w in pdf_page.findChildren(QPushButton)}
+    for gone in ("旋转选中", "导出选中", "删除所选", "启用压缩功能", "压缩全部", "压缩部分"):
+        check(f"面板上没有「{gone}」", gone not in all_btns, str(sorted(all_btns))[:160])
+    check("压缩条里有「确认压缩」", "确认压缩" in all_btns)
+    check("右键菜单信号可用", bool(win.pdf_grid.context_requested))
 
     print("\n[8] 截图")
     # 还原成导入时的顺序，截图要反映真实使用状态
