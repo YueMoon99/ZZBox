@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
@@ -74,6 +74,8 @@ from app.core.image import (
     ImageSettings,
     build_ai_steps,
     build_compress_steps,
+    merge_images_to_pdf,
+    out_format,
     plan_summary,
     preview_compress_bytes,
     probe_image,
@@ -98,6 +100,7 @@ from app.core.pdf_images import PageStat, estimate_pdf, merge_pdf, stage_page
 from app.core.probe import EnvInfo, probe_environment, _find_tool
 from app.core.runner import EncodeRunner
 from app.ui import icons, style
+from app.ui.export_dialog import ExportChoice, ExportDialog
 from app.ui.page_grid import PageGrid
 from app.ui.tray import Tray
 from app.ui.widgets import (
@@ -185,6 +188,9 @@ class _Emitter(QObject):
     pdf_stat_ready = Signal(int, str, int, object)
     # 估算失败也要回报，否则格子会永远停在「估算中…」
     pdf_stat_failed = Signal(int, str, int, str)
+    # 图片压缩预估（后台真编码取样）：(代次, 源图路径, 质量, 预估字节)。
+    # 和 PDF 页一样带代次，拖质量条时旧结果直接丢弃
+    img_est_ready = Signal(int, str, int, int)
 
 
 class MainWindow(QMainWindow):
@@ -266,9 +272,22 @@ class MainWindow(QMainWindow):
         # 同一页可以反复压缩，每一轮留一份，Ctrl+Z 才能逐级回退。
         self._pdf_zip_round = 0
         # Ctrl+Z 的快照栈：每一步队列操作前压一份，撤销就是整份换回来
-        self._pdf_undo_stack: list[list[tuple]] = []
+        self._pdf_undo_stack: list[tuple] = []
         self._pdf_compress_uids: list[str] = []
         self._pdf_pair_cache: dict[str, str] = {}
+        # 预估比原图大的 uid：预估行用警示色，确认后保持原样
+        self._pdf_est_bigger: set[str] = set()
+        # 重编码反而更大、保持原样的图片 uid：挂「不可压缩」黄标
+        self._pdf_img_kept: set[str] = set()
+        # 图片预估缓存：(源图路径, 质量) → 预估字节。拖质量条时只查缓存 +
+        # 比例缩放，真编码扔到后台线程，不然每拖一格就解码编码一遍会卡死
+        self._pdf_img_est_cache: dict[tuple[str, int], int] = {}
+        # ---- 导出保存对话框的结果 ----
+        self._export_container = "mp4"          # 对话框选的视频容器
+        self._single_out_name: str | None = None  # 单文件导出时用户指定的名字（含扩展名）
+        self._img_pdf_target: Path | None = None  # 图片队列合成 PDF 的目标文件
+        self._img_pdf_files: list[Path] = []      # 合成用的中间图片
+        self._img_pdf_tmp: Path | None = None     # 中间图片的临时目录
         self._quitting = False
         self._tray_hinted = False
         self.tray: Tray | None = None
@@ -280,6 +299,7 @@ class MainWindow(QMainWindow):
         self.emitter.pdf_thumb_ready.connect(self._on_pdf_thumb)
         self.emitter.pdf_stat_ready.connect(self._on_pdf_stat)
         self.emitter.pdf_stat_failed.connect(self._on_pdf_stat_failed)
+        self.emitter.img_est_ready.connect(self._on_img_est)
 
         self.runner = EncodeRunner(self)
         self.runner.progress.connect(self._on_progress)
@@ -607,6 +627,7 @@ class MainWindow(QMainWindow):
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.reordered.connect(self._on_reorder)
+        self.table.delete_pressed.connect(self._delete_selected)
         lay.addWidget(self._queue_frame(self.table), 1)
 
         # ---- 参数页：视频压缩 / AI 增强 ----
@@ -647,6 +668,7 @@ class MainWindow(QMainWindow):
         self.img_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.img_table.itemSelectionChanged.connect(self._img_on_selection)
         self.img_table.reordered.connect(self._img_on_reorder)
+        self.img_table.delete_pressed.connect(self._img_delete_selected)
         lay.addWidget(self._queue_frame(self.img_table), 1)
 
         self.img_tabs = PropertyTabs()
@@ -716,6 +738,7 @@ class MainWindow(QMainWindow):
         self.pdf_grid.order_changed.connect(self._pdf_on_reorder)
         self.pdf_grid.itemSelectionChanged.connect(self._pdf_on_selection)
         self.pdf_grid.context_requested.connect(self._pdf_context_menu)
+        self.pdf_grid.delete_requested.connect(lambda: self._pdf_delete_selected())
         frame = QFrame()
         frame.setObjectName("queue")
         fl = QVBoxLayout(frame)
@@ -840,7 +863,7 @@ class MainWindow(QMainWindow):
             )
             for it in self.pdf_items
         )
-        return rows, dict(self._pdf_staged)
+        return rows, dict(self._pdf_staged), set(self._pdf_img_kept)
 
     def _pdf_push_undo(self) -> None:
         self._pdf_undo_stack.append(self._pdf_snapshot())
@@ -850,7 +873,7 @@ class MainWindow(QMainWindow):
     def _pdf_undo(self) -> None:
         if self._busy() or not self._pdf_undo_stack:
             return
-        rows, staged = self._pdf_undo_stack.pop()
+        rows, staged, kept = self._pdf_undo_stack.pop()
         items: list[PdfItem] = []
         for (
             uid, src, kind, index, rot, label, w, h,
@@ -868,6 +891,7 @@ class MainWindow(QMainWindow):
         self.pdf_items = items
         self.pdf_by_uid = {it.uid: it for it in items}
         self._pdf_staged = dict(staged)
+        self._pdf_img_kept = set(kept)
         self._pdf_zip_close()
         self._pdf_rebuild_grid()
         self._pdf_on_selection()
@@ -898,6 +922,8 @@ class MainWindow(QMainWindow):
     def _pdf_zip_close(self) -> None:
         self._pdf_compress_uids = []
         self._pdf_pair_cache = {}
+        self._pdf_est_bigger = set()
+        self.pdf_zip_quality.setEnabled(True)
         self.pdf_zip_panel.setVisible(False)
         self._pdf_zip_stop_estimate()
         self._pdf_repaint_subs()
@@ -934,6 +960,21 @@ class MainWindow(QMainWindow):
             return bool(path and Path(path).exists())
         return False
 
+    def _pdf_is_incompressible(self, it: PdfItem) -> bool:
+        """这页被判定为压不动 —— 决定右上角「不可压缩」黄标显示与否。
+
+        PDF 页：扫描/估算给出明确结论（PageStat 存在且 compressible=False）
+        才标；还在估算中的不标，免得闪一下又消失。用原始 (src, index) 查
+        —— PDF 页的 ref.src 永远指向原文件，这是它的稳定身份。
+        图片：确认压缩时重编码反而更大、保持原样的也算压不动。
+        """
+        if it.ref.kind == "image":
+            return it.uid in self._pdf_img_kept and not (
+                it.staged and Path(it.staged).exists()
+            )
+        st = self._pdf_stats.get((it.ref.src, it.ref.index))
+        return st is not None and not st.compressible
+
     def _pdf_image_settings(self, quality: int | None = None) -> ImageSettings:
         """PDF 里压图片时，照搬图片工作台当前那一套方案。
 
@@ -957,8 +998,11 @@ class MainWindow(QMainWindow):
         if it.uid in self._pdf_compress_uids:
             pair = self._pdf_pair_cache.get(it.uid)
             if pair:
-                # 「本页无图片」「估算失败」不是体积数字，用暗色，别冒充成功
-                return pair, "ok" if "→" in pair else "dim"
+                # 「本页无图片」「估算失败」不是体积数字，用暗色，别冒充成功；
+                # 预估比原图大用警示色 —— 这事必须在点确认之前就看见
+                if "→" not in pair:
+                    return pair, "dim"
+                return pair, "warn" if it.uid in self._pdf_est_bigger else "ok"
             return "估算中…", "dim"
         if it.staged:
             if it.ref.kind == "image":
@@ -968,6 +1012,8 @@ class MainWindow(QMainWindow):
                     new = 0
                 return "已压缩 " + _pair_text(it.size, new), "ok"
             return "已压缩 · 导出时生效", "ok"
+        if it.uid in self._pdf_img_kept:
+            return "已保持原样 · 重编码反而更大", "warn"
         if it.ref.kind == "image":
             return _fmt_bytes(it.size), "dim"
         return "pdf文件", "dim"
@@ -976,9 +1022,12 @@ class MainWindow(QMainWindow):
         for it in self.pdf_items:
             text, tone = self._pdf_sub_of(it)
             self.pdf_grid.set_sub(it.uid, text, tone)
-            self.pdf_grid.set_badge(
-                it.uid, "已压缩" if self._pdf_is_compressed(it) else ""
-            )
+            if self._pdf_is_compressed(it):
+                self.pdf_grid.set_badge(it.uid, "已压缩", "ok")
+            elif self._pdf_is_incompressible(it):
+                self.pdf_grid.set_badge(it.uid, "不可压缩", "warn")
+            else:
+                self.pdf_grid.set_badge(it.uid, "")
 
     def _pdf_zip_refresh_estimate(self) -> None:
         """拖动质量条就更新 —— 图片真编码取样，PDF 页按比例缩放缓存值。
@@ -993,6 +1042,8 @@ class MainWindow(QMainWindow):
         self.pdf_zip_qv.setText(str(q))
         cur_sum = est_sum = 0
         no_image = pending = 0
+        bigger: set[str] = set()
+        no_quality = 0
         for it in self._pdf_zip_targets():
             key = (it.ref.src, it.ref.index)
             st = self._pdf_stats.get(key) if it.ref.kind == "pdf" else None
@@ -1007,13 +1058,25 @@ class MainWindow(QMainWindow):
                     self._pdf_pair_cache[it.uid] = _pair_text(cur, est)
                     cur_sum += cur
                     est_sum += est
+                    if est >= cur:
+                        bigger.add(it.uid)
                 elif key in self._pdf_est_failed:
                     self._pdf_pair_cache[it.uid] = "估算失败"
                 else:
                     self._pdf_pair_cache[it.uid] = "估算中…"
                     pending += 1
+            if not self._pdf_quality_applies(it):
+                no_quality += 1
             text, tone = self._pdf_sub_of(it)
             self.pdf_grid.set_sub(it.uid, text, tone)
+            # 压缩过程中同步角标：压过的绿标 / 判定压不动的黄标
+            if self._pdf_is_compressed(it):
+                self.pdf_grid.set_badge(it.uid, "已压缩", "ok")
+            elif self._pdf_is_incompressible(it):
+                self.pdf_grid.set_badge(it.uid, "不可压缩", "warn")
+            else:
+                self.pdf_grid.set_badge(it.uid, "")
+        self._pdf_est_bigger = bigger
 
         n = len(self._pdf_compress_uids)
         extra = f" · {no_image} 页无图片" if no_image else ""
@@ -1031,18 +1094,73 @@ class MainWindow(QMainWindow):
             hint = f"选中 {n} 项 · 正在估算…（大图可能要几秒）"
         else:
             hint = f"选中 {n} 项 · 调整质量后点「确认压缩」"
+        # 质量对 PNG 无损输出完全无效 —— 禁用滑块并写明白，别让人拖一个
+        # 纹丝不动的数字，以为界面卡死了
+        if n and no_quality == n:
+            self.pdf_zip_quality.setEnabled(False)
+            hint += " · PNG 无损输出，质量不生效"
+        else:
+            self.pdf_zip_quality.setEnabled(True)
+            if no_quality:
+                hint += f" · {no_quality} 项为 PNG 无损输出，不受质量影响"
+        if bigger:
+            hint += f" · {len(bigger)} 项预计比原图大，确认后保持原样（可改 JPG/WebP）"
         self.pdf_zip_hint.setText(hint)
 
+    def _pdf_quality_applies(self, it: PdfItem) -> bool:
+        """质量参数对这一项有没有效 —— PNG 是无损格式，质量不影响体积。
+
+        全部选中项都无效时，质量条就该禁用并说明，不然拖半天数字不动，
+        看起来像卡死（用户实测截图里就是这个现象）。
+        """
+        eff = self._pdf_effective_ref(it)
+        if eff.kind != "image":
+            return True  # PDF 页的内嵌图按质量重编码，质量有效
+        try:
+            info = self.img_cache.get(eff.src) or probe_image(Path(eff.src))
+            return out_format(info, self._pdf_image_settings()) != "png"
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _pdf_invalidate_img_est(self, *_a) -> None:
+        """图片方案（格式/长边/元数据）变了 —— 预估缓存全部作废重算。"""
+        self._pdf_img_est_cache.clear()
+        if self._pdf_compress_uids:
+            self._pdf_zip_refresh_estimate()
+            self.pdf_zip_timer.start()
+
     def _pdf_quick_estimate(self, it: PdfItem, q: int) -> tuple[int, int]:
-        """轻量估算：图片真编一次到内存，PDF 页拿缓存按比例推。"""
+        """轻量估算：只查缓存 + 比例缩放，绝不做真编码。
+
+        以前拖一下质量条就对每张图真编一次码，几十张图的队列直接把
+        UI 线程卡死，界面看起来"预估数字不动"其实是在排队等编码。
+        现在真编码统一由 _pdf_zip_estimate 后台跑，这里只做 O(1) 查表。
+        """
         eff = self._pdf_effective_ref(it)
         if eff.kind == "image":
+            src = eff.src
             try:
-                info = self.img_cache.get(eff.src) or probe_image(Path(eff.src))
-                est = preview_compress_bytes(Path(eff.src), self._pdf_image_settings(q), info)
-                return Path(eff.src).stat().st_size, est
-            except Exception:
-                return it.size, 0
+                cur = Path(src).stat().st_size
+            except OSError:
+                cur = it.size
+            hit = self._pdf_img_est_cache.get((src, q))
+            if hit:
+                return cur, hit
+            # 没有当前质量的精确值，就拿最近一次缓存按比例推，
+            # 拖动过程中数字跟着走；后台算完精确值会自动刷回来
+            base_q, base_est = self._nearest_img_est(src, q)
+            if base_est:
+                try:
+                    info = self.img_cache.get(src) or probe_image(Path(src))
+                    fmt = out_format(info, self._pdf_image_settings(q))
+                except Exception:
+                    fmt = "jpg"
+                if fmt == "png" or base_q == q:
+                    est = base_est        # PNG 无损，质量不影响体积
+                else:
+                    est = int(base_est * (q / base_q) ** 1.7)
+                return cur, est
+            return cur, 0
 
         st = self._pdf_stats.get((eff.src, eff.index))
         if st is None:
@@ -1050,6 +1168,18 @@ class MainWindow(QMainWindow):
         cur = st.cur_bytes or 0
         est = int((st.est_bytes or cur) * (q / 78.0) ** 1.7)
         return cur, est
+
+    def _nearest_img_est(self, src: str, q: int) -> tuple[int, int]:
+        """找同一张图最接近质量 q 的缓存，返回 (缓存质量, 预估字节)。"""
+        best: tuple[int, int] = (0, 0)
+        best_d = 1 << 30
+        for (s, bq), est in self._pdf_img_est_cache.items():
+            if s != src:
+                continue
+            d = abs(bq - q)
+            if d < best_d:
+                best_d, best = d, (bq, est)
+        return best
 
     def _pdf_zip_on_quality(self, _v: int) -> None:
         self._pdf_zip_refresh_estimate()
@@ -1070,20 +1200,35 @@ class MainWindow(QMainWindow):
         self._pdf_est_cancel = threading.Event()
 
     def _pdf_zip_estimate(self) -> None:
-        """PDF 页的 PageStat 后台算一次，之后拖质量条只做比例缩放。"""
+        """PDF 页和图片的精确预估都放后台算，之后拖质量条只做比例缩放。
+
+        以前图片的预估在 UI 线程真编一次码，拖质量条时每拖一格就
+        解码+编码一遍，队列里图一多就卡到数字不动。现在统一扔线程池。
+        """
         if not self._pdf_compress_uids:
             return
         pages = []
+        images = []
         for it in self._pdf_zip_targets():
             eff = self._pdf_effective_ref(it)
-            if eff.kind != "pdf":
-                continue
-            if (eff.src, eff.index) in self._pdf_stats:
-                continue
-            if (eff.src, eff.index) in self._pdf_est_failed:
-                continue
-            pages.append((eff, it))
-        if not pages:
+            if eff.kind == "pdf":
+                if (eff.src, eff.index) in self._pdf_stats:
+                    continue
+                if (eff.src, eff.index) in self._pdf_est_failed:
+                    continue
+                pages.append((eff, it))
+            else:
+                q = self.pdf_zip_quality.value()
+                if (eff.src, q) in self._pdf_img_est_cache:
+                    continue
+                # PNG 无损：质量不影响体积，同一张图采样过一次就够，
+                # 别让每个质量值都白编一遍码
+                if not self._pdf_quality_applies(it) and any(
+                    s == eff.src for (s, _q) in self._pdf_img_est_cache
+                ):
+                    continue
+                images.append((eff.src, q))
+        if not pages and not images:
             return
         self._pdf_est_stop_and_restart()
         gen = self._pdf_est_gen
@@ -1097,6 +1242,40 @@ class MainWindow(QMainWindow):
             groups.setdefault(eff.src, []).append((eff, it))
         for src, pairs in groups.items():
             self._pdf_est_pool.submit(self._pdf_est_job, gen, src, pairs, 78, cancel)
+        # 图片预估：真编一次码取样。同一张图同一个质量只算一次。
+        # 设置必须在 UI 线程读好再传进去 —— 后台线程碰 Qt 控件是未定义行为
+        img_settings = self._pdf_image_settings(self.pdf_zip_quality.value())
+        seen_img: set[tuple[str, int]] = set()
+        for src, q in images:
+            if (src, q) in seen_img:
+                continue
+            seen_img.add((src, q))
+            self._pdf_est_pool.submit(self._img_est_job, gen, src, q, img_settings, cancel)
+
+    def _img_est_job(self, gen: int, src: str, quality: int,
+                     settings: ImageSettings, cancel) -> None:
+        """后台算一张图在指定质量下的压缩预估。"""
+        if cancel.is_set():
+            return
+        try:
+            info = probe_image(Path(src))
+            s = ImageSettings(
+                fmt=settings.fmt, quality=quality,
+                max_side=settings.max_side, strip_meta=settings.strip_meta,
+            )
+            est = preview_compress_bytes(Path(src), s, info)
+        except Exception:  # noqa: BLE001
+            return
+        if cancel.is_set():
+            return
+        self.emitter.img_est_ready.emit(gen, src, quality, est)
+
+    def _on_img_est(self, gen: int, src: str, quality: int, est: int) -> None:
+        if gen != self._pdf_est_gen:
+            return
+        self._pdf_img_est_cache[(src, quality)] = est
+        if self._pdf_compress_uids:
+            self._pdf_zip_refresh_estimate()
 
     def _pdf_est_job(self, gen: int, src: str, pairs: list, quality: int, cancel) -> None:
         todo: list[int] = []
@@ -1192,6 +1371,7 @@ class MainWindow(QMainWindow):
         def work(progress):
             total = len(items)
             ffmpeg = _find_tool("ffmpeg")
+            kept = 0
             for i, it in enumerate(items):
                 eff = self._pdf_effective_ref(it)
                 if eff.kind == "image":
@@ -1205,13 +1385,28 @@ class MainWindow(QMainWindow):
                         raise RuntimeError(err)
                     for cmd in cmds:
                         subprocess.run(cmd, check=True, capture_output=True)
-                    results.append(("image", it.uid, str(made), made.stat().st_size))
+                    new = made.stat().st_size
+                    try:
+                        cur = Path(eff.src).stat().st_size
+                    except OSError:
+                        cur = it.size
+                    if new >= cur:
+                        # 重编码反而更大（PNG 无损重编码、JPG 转 PNG 膨胀）。
+                        # 和纯文字页同一个道理：不造一份更大的「压缩件」
+                        # 换进队列骗自己 —— 保持原样，角标写清楚原因。
+                        made.unlink(missing_ok=True)
+                        results.append(("keep", it.uid, "", new))
+                        kept += 1
+                    else:
+                        results.append(("image", it.uid, str(made), new))
                 else:
                     out = out_dir / f"p{i:04d}.pdf"
                     stage_page(eff, out, q)
                     results.append(("pdf", it.uid, str(out), out.stat().st_size))
                 progress(int((i + 1) / total * 100))
-            note = f"已压缩 {total} 项"
+            note = f"已压缩 {total - kept} 项"
+            if kept:
+                note += f"，{kept} 项保持原样（重编码反而更大）"
             if skipped:
                 note += f"，{skipped} 页无图片已跳过"
             return note
@@ -1242,6 +1437,9 @@ class MainWindow(QMainWindow):
         """丢掉暂存：退出、清空时都走这里。"""
         self._pdf_staged.clear()
         self._pdf_pair_cache = {}
+        self._pdf_img_est_cache.clear()
+        self._pdf_img_kept.clear()
+        self._pdf_est_bigger = set()
         if self._pdf_stage_dir is not None:
             shutil.rmtree(self._pdf_stage_dir, ignore_errors=True)
             self._pdf_stage_dir = None
@@ -1526,41 +1724,41 @@ class MainWindow(QMainWindow):
             self._pdf_run_pdf_one(refs, stem=f"选中_{len(refs)}页")
 
     def _pdf_export(self) -> None:
-        """底部导出：按当前队列顺序落盘。"""
+        """底部导出：按当前队列顺序落盘，格式在保存对话框里选。
+
+        以前这里弹的是「合并为 1 个 / 按来源分别 / PNG / JPG」菜单，现在
+        菜单没有了 —— 保存类型下拉就是这四项，和视频、图片导出一个手感。
+        """
         if not self.pdf_items:
             QMessageBox.information(
                 self, "队列是空的", "先把 PDF 或图片拖进来，或点右上角“+”添加。"
             )
             return
-        # 托盘菜单也能触发导出，但选格式必须看得见菜单 —— 窗口藏着的话先叫回来
+        # 托盘菜单也能触发导出，但保存对话框必须看得见 —— 窗口藏着的话先叫回来
         if not self.isVisible():
             self.restore_from_tray()
         refs = self._pdf_target_refs(only_selected=False)
-        menu = QMenu(self)
-        act_one = menu.addAction("合并为 1 个 PDF")
-        act_by_src = menu.addAction("按来源分别导出多个 PDF")
-        menu.addSeparator()
-        act_png = menu.addAction("导出为 PNG 图片（每页一张）")
-        act_jpg = menu.addAction("导出为 JPG 图片（每页一张）")
-        chosen = menu.exec(
-            self.btn_start.mapToGlobal(self.btn_start.rect().topLeft())
-        )
-        if chosen is None:
+        choice = self._ask_export("pdf", default_name="合并", count=len(refs))
+        if choice is None:
             return
-        if chosen is act_png:
-            self._pdf_run_images(refs, "png")
-        elif chosen is act_jpg:
-            self._pdf_run_images(refs, "jpg")
-        elif chosen is act_by_src:
+        if choice.fmt in ("png", "jpg"):
+            self._pdf_run_images(refs, choice.fmt, out_dir=choice.out_dir)
+        elif choice.fmt == "pdf_many":
             self._pdf_run_pdf_many(refs, prefix="整理")
         else:
-            self._pdf_run_pdf_one(refs, stem="合并")
+            self._pdf_run_pdf_one(refs, stem="合并", name=choice.filename or None)
 
     def _pdf_stamp(self) -> str:
         return time.strftime("%Y%m%d_%H%M")
 
-    def _pdf_run_pdf_one(self, refs: list[PageRef], stem: str) -> None:
-        out = self._pdf_out_base() / f"{safe_stem(stem)}_{self._pdf_stamp()}.pdf"
+    def _pdf_run_pdf_one(
+        self, refs: list[PageRef], stem: str, name: str | None = None
+    ) -> None:
+        # 保存对话框给了名字就用它（重名自动挂序号），否则按「合并_时间戳」
+        if name:
+            out = unique_path(self._pdf_out_base(), safe_stem(name), ".pdf")
+        else:
+            out = self._pdf_out_base() / f"{safe_stem(stem)}_{self._pdf_stamp()}.pdf"
         if self._pdf_zip_active():
             self._pdf_start_zip([(refs, out)], f"导出 {len(refs)} 页")
             return
@@ -1646,23 +1844,29 @@ class MainWindow(QMainWindow):
         self.current_label.setText(f"{label}…")
         self.pdf_runner.start(work, "zip-export")
 
-    def _pdf_run_images(self, refs: list[PageRef], fmt: str) -> None:
+    def _pdf_run_images(
+        self, refs: list[PageRef], fmt: str, out_dir: Path | None = None
+    ) -> None:
         base = self._pdf_out_base()
-        # 单来源用自己的名字，多来源混排就叫「拆分」，免得张冠李戴
-        heads = {Path(ref.src).stem for ref in refs}
-        tag = safe_stem(next(iter(heads))) if len(heads) == 1 else "拆分"
-        out_dir = base / f"{tag}_{'png' if fmt == 'png' else 'jpg'}_{self._pdf_stamp()}"
+        if out_dir is not None:
+            # 保存对话框来的：按用户要求直接散进所选文件夹，不再套时间戳子目录
+            target = out_dir
+        else:
+            # 右键「导出选中」的老路：单来源用自己的名字，多来源混排叫「拆分」
+            heads = {Path(ref.src).stem for ref in refs}
+            tag = safe_stem(next(iter(heads))) if len(heads) == 1 else "拆分"
+            target = base / f"{tag}_{'png' if fmt == 'png' else 'jpg'}_{self._pdf_stamp()}"
 
         def work(progress):
             files = export_images(
-                refs, out_dir,
+                refs, target,
                 fmt=fmt, dpi=200.0, quality=92, progress=progress,
             )
-            return f"已导出 {len(files)} 张图片到 {out_dir.name}"
+            return f"已导出 {len(files)} 张图片到 {target.name}"
 
         self._pdf_kind = "image"
         self._pdf_t0 = time.time()
-        self._pdf_result = str(out_dir)
+        self._pdf_result = str(target)
         self._set_running(True)
         self._set_progress(0)
         self.current_label.setText(f"正在导出 {len(refs)} 张图片…")
@@ -1728,6 +1932,11 @@ class MainWindow(QMainWindow):
                     it = self.pdf_by_uid.get(uid)
                     if it is None:
                         continue
+                    if what == "keep":
+                        # 重编码反而更大：什么都没换，挂黄标说明原因
+                        self._pdf_img_kept.add(uid)
+                        continue
+                    self._pdf_img_kept.discard(uid)
                     if what == "image":
                         it.origin_src = it.origin_src or it.ref.src
                         it.origin_kind = it.origin_kind or it.ref.kind
@@ -1746,12 +1955,12 @@ class MainWindow(QMainWindow):
                         it.thumb_png = b""
                         it.thumbbed = False
                         self._pdf_start_thumbs([it])
-                count = len(self._pdf_zip_results)
+                count = sum(1 for r in self._pdf_zip_results if r[0] != "keep")
                 self._set_progress(100)
                 self.current_label.setText(msg or f"已压缩 {count} 项")
                 self.stats_label.setText("压缩结果已换入队列，导出时直接使用")
                 if not self.isVisible() and self.tray:
-                    self.tray.notify("压缩完成", f"{count} 项已换入队列")
+                    self.tray.notify("压缩完成", msg or f"{count} 项已换入队列")
             self._pdf_zip_results = []
             self._pdf_zip_close()
             self._pdf_kind = ""
@@ -1814,6 +2023,7 @@ class MainWindow(QMainWindow):
         panel.add("质量", self._quality_row())
         panel.add("缩放", self._scale_row())
         panel.set_note("选择文件后显示输出规格")
+        panel.pin_height()
         return panel
 
     def _quality_row(self) -> QWidget:
@@ -1897,37 +2107,43 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ 视频 AI 面板
     def _page_ai(self) -> QWidget:
-        panel = OptionPanel(2)
+        # 两行三列，像表格一样竖向对齐：
+        #   超分  补帧  模型
+        #   编码  降噪  锐化
+        panel = OptionPanel(3)
         self.ai_panel = panel
 
+        # fill=True：按钮平分单元格宽度，同列上下两行的按钮组右边缘对齐
         self.ai_scale_chips = ChipGroup(
-            [("0", "关闭"), ("2", "2×"), ("3", "3×"), ("4", "4×")]
+            [("0", "关闭"), ("2", "2×"), ("3", "3×"), ("4", "4×")], fill=True
         )
         self.ai_scale_chips.set_value("2")
         self.ai_scale_chips.changed.connect(lambda _k: self._refresh_ai_rows())
 
         self.ai_model_chips = ChipGroup(
-            [("photo", "真人实拍"), ("anime", "动画番剧")]
+            [("photo", "真人实拍"), ("anime", "动画番剧")], fill=True
         )
         self.ai_model_chips.set_value(DEFAULT_MODEL)
         self.ai_model_chips.changed.connect(lambda _k: self._refresh_ai_rows())
         for key, (_n, _sc, _label, note) in MODELS.items():
             self.ai_model_chips.button(key).setToolTip(note)
 
-        self.ai_interp_chips = ChipGroup([("1", "关闭"), ("2", "2×"), ("4", "4×")])
+        self.ai_interp_chips = ChipGroup(
+            [("1", "关闭"), ("2", "2×"), ("4", "4×")], fill=True
+        )
         self.ai_interp_chips.set_value("1")
         self.ai_interp_chips.changed.connect(lambda _k: self._refresh_ai_rows())
         self.ai_interp_chips.button("2").setToolTip("帧率翻倍，时长不变，音轨原样保留")
 
         self.ai_enc_chips = ChipGroup(
-            [("h264", "H.264"), ("hevc", "HEVC"), ("av1", "AV1")]
+            [("h264", "H.264"), ("hevc", "HEVC"), ("av1", "AV1")], fill=True
         )
         self.ai_enc_chips.set_value("hevc")
         self.ai_enc_chips.changed.connect(lambda _k: self._refresh_ai_rows())
 
         # 降噪 / 锐化：补模型短板的两个开关，挤在同一格里省一行
         self.ai_denoise_chips = ChipGroup(
-            [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
+            [("0", "关"), ("1", "轻度"), ("2", "较强")], fill=True
         )
         self.ai_denoise_chips.set_value("0")
         self.ai_denoise_chips.changed.connect(lambda _k: self._refresh_ai_rows())
@@ -1937,7 +2153,7 @@ class MainWindow(QMainWindow):
                 "逐帧对比过：轻度档对细节几乎无损，压制痕迹明显的源值得开"
             )
         self.ai_sharpen_chips = ChipGroup(
-            [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
+            [("0", "关"), ("1", "轻度"), ("2", "较强")], fill=True
         )
         self.ai_sharpen_chips.set_value("1")
         self.ai_sharpen_chips.changed.connect(lambda _k: self._refresh_ai_rows())
@@ -1947,37 +2163,18 @@ class MainWindow(QMainWindow):
                 "默认轻度；开到「较强」会开始出白边，慎用"
             )
 
-        panel.add("超分", self.ai_scale_chips)
-        panel.add("模型", self.ai_model_chips)
-        panel.add("补帧", self.ai_interp_chips)
-        panel.add("编码", self.ai_enc_chips)
-        # 降噪/锐化两组胶囊半格放不下，独占一行
-        panel.add_row(self._ai_quality_row())
+        panel.add("超分", self.ai_scale_chips, tag_w=32)
+        panel.add("补帧", self.ai_interp_chips, tag_w=32)
+        panel.add("模型", self.ai_model_chips, tag_w=32)
+        panel.add("编码", self.ai_enc_chips, tag_w=32)
+        panel.add("降噪", self.ai_denoise_chips, tag_w=32)
+        panel.add("锐化", self.ai_sharpen_chips, tag_w=32)
 
         self.ai_engine_info = panel.note
         self.ai_alert = panel.alert
         panel.set_note("引擎检测中…")
+        panel.pin_height()
         return panel
-
-    def _ai_quality_row(self) -> QWidget:
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        # 一组「标签 + 三颗胶囊」要留够间隙，不然「降噪」和「关」会粘成
-        # 一个词，看上去像「降噪关」
-        row.setSpacing(10)
-        for text, widget in (
-            ("降噪", self.ai_denoise_chips),
-            ("锐化", self.ai_sharpen_chips),
-        ):
-            tag = QLabel(text)
-            tag.setObjectName("optlabel")
-            tag.setFixedWidth(26)
-            row.addWidget(tag)
-            row.addWidget(widget, 1)
-            row.addSpacing(6)
-        wrap = QWidget()
-        wrap.setLayout(row)
-        return wrap
 
     # ------------------------------------------------------------ 托盘
     def _setup_tray(self) -> None:
@@ -2117,6 +2314,7 @@ class MainWindow(QMainWindow):
         )
         self.img_fmt_chips.set_value("keep")
         self.img_fmt_chips.changed.connect(lambda _k: self._img_refresh_rows())
+        self.img_fmt_chips.changed.connect(self._pdf_invalidate_img_est)
         self.img_fmt_chips.button("keep").setToolTip("跟随每张图自己的格式，只改质量和尺寸")
         self.img_fmt_chips.button("jpg").setToolTip("通用性最好，不支持透明")
         self.img_fmt_chips.button("png").setToolTip("无损，体积最大，支持透明")
@@ -2136,6 +2334,7 @@ class MainWindow(QMainWindow):
         )
         self.img_side_chips.set_value("0")
         self.img_side_chips.changed.connect(lambda _k: self._img_refresh_rows())
+        self.img_side_chips.changed.connect(self._pdf_invalidate_img_est)
         self.img_side_input = QLineEdit()
         self.img_side_input.setPlaceholderText("像素")
         self.img_side_input.setFixedWidth(64)
@@ -2146,6 +2345,7 @@ class MainWindow(QMainWindow):
         self.img_meta_chips = ChipGroup([("keep", "保留"), ("strip", "清除")])
         self.img_meta_chips.set_value("keep")
         self.img_meta_chips.changed.connect(lambda _k: self._img_refresh_rows())
+        self.img_meta_chips.changed.connect(self._pdf_invalidate_img_est)
         self.img_meta_chips.button("strip").setToolTip(
             "去掉 EXIF、拍摄时间、GPS 和相机型号 —— 发图前建议清掉"
         )
@@ -2157,6 +2357,7 @@ class MainWindow(QMainWindow):
 
         self.img_cost_info = panel.note
         panel.set_note("选择图片后显示输出规格")
+        panel.pin_height()
         return panel
 
     def _on_img_quality(self, v: int) -> None:
@@ -2185,17 +2386,20 @@ class MainWindow(QMainWindow):
         return wrap
 
     def _page_img_ai(self) -> QWidget:
-        panel = OptionPanel(2)
+        # 和视频 AI 页同一套两行三列，标签竖向对齐：
+        #   倍率  模型  格式
+        #   降噪  锐化
+        panel = OptionPanel(3)
         self.img_ai_panel = panel
 
         self.img_ai_scale = ChipGroup(
-            [("0", "关闭"), ("2", "2×"), ("3", "3×"), ("4", "4×")]
+            [("0", "关闭"), ("2", "2×"), ("3", "3×"), ("4", "4×")], fill=True
         )
         self.img_ai_scale.set_value("2")
         self.img_ai_scale.changed.connect(lambda _k: self._img_refresh_rows())
 
         self.img_ai_model = ChipGroup(
-            [("photo", "真人实拍"), ("anime", "动画番剧")]
+            [("photo", "真人实拍"), ("anime", "动画番剧")], fill=True
         )
         self.img_ai_model.set_value(DEFAULT_MODEL)
         self.img_ai_model.changed.connect(lambda _k: self._img_refresh_rows())
@@ -2203,49 +2407,34 @@ class MainWindow(QMainWindow):
             self.img_ai_model.button(key).setToolTip(note)
 
         self.img_ai_fmt = ChipGroup(
-            [("keep", "跟随源"), ("png", "PNG"), ("jpg", "JPG"), ("webp", "WebP")]
+            [("keep", "跟随源"), ("png", "PNG"), ("jpg", "JPG"), ("webp", "WebP")],
+            fill=True,
         )
         self.img_ai_fmt.set_value("keep")
         self.img_ai_fmt.changed.connect(lambda _k: self._img_refresh_rows())
         self.img_ai_fmt.button("png").setToolTip("超分细节最完整的落盘格式，体积也最大")
 
         self.img_ai_denoise = ChipGroup(
-            [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
+            [("0", "关"), ("1", "轻度"), ("2", "较强")], fill=True
         )
         self.img_ai_denoise.set_value("0")
         self.img_ai_denoise.changed.connect(lambda _k: self._img_refresh_rows())
         self.img_ai_sharpen = ChipGroup(
-            [("0", "关"), ("1", "轻度"), ("2", "较强")], stretch=False
+            [("0", "关"), ("1", "轻度"), ("2", "较强")], fill=True
         )
         self.img_ai_sharpen.set_value("1")
         self.img_ai_sharpen.changed.connect(lambda _k: self._img_refresh_rows())
 
-        panel.add("倍率", self.img_ai_scale)
-        panel.add("模型", self.img_ai_model)
-        panel.add("格式", self.img_ai_fmt)
-        panel.add("画质", self._img_ai_quality_row())
+        panel.add("倍率", self.img_ai_scale, tag_w=32)
+        panel.add("模型", self.img_ai_model, tag_w=32)
+        panel.add("格式", self.img_ai_fmt, tag_w=32)
+        panel.add("降噪", self.img_ai_denoise, tag_w=32)
+        panel.add("锐化", self.img_ai_sharpen, tag_w=32)
 
         self.img_ai_info = panel.note
         panel.set_note("超分引擎就绪后可批量放大")
+        panel.pin_height()
         return panel
-
-    def _img_ai_quality_row(self) -> QWidget:
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(10)
-        for text, widget in (
-            ("降噪", self.img_ai_denoise),
-            ("锐化", self.img_ai_sharpen),
-        ):
-            tag = QLabel(text)
-            tag.setObjectName("optlabel")
-            tag.setFixedWidth(26)
-            row.addWidget(tag)
-            row.addWidget(widget, 1)
-            row.addSpacing(6)
-        wrap = QWidget()
-        wrap.setLayout(row)
-        return wrap
 
     # ------------------------------------------------------------ 图片参数收集
     def _img_side_value(self) -> int:
@@ -2504,7 +2693,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ 图片说明行
     def _refresh_img(self) -> None:
-        """重算图片面板底部的输出规格与开销。"""
+        """重算图片面板底部的输出规格与开销。
+
+        提示区恒定两行（灰 + 黄），文案全部压成单行 —— 多条警告用「 · 」
+        并进同一行，绝不换行撑高面板。
+        """
         if not hasattr(self, "img_cost_info"):
             return
         s = self._collect_img()
@@ -2515,7 +2708,9 @@ class MainWindow(QMainWindow):
             self.img_cost_info.setText(
                 "选择图片后显示输出规格" if not n else "读取中…"
             )
+            self.img_panel.set_alert("")
             self.img_ai_info.setText("超分引擎就绪后可批量放大")
+            self.img_ai_panel.set_alert("")
             return
 
         spec, cost = plan_summary(info, s)
@@ -2523,19 +2718,22 @@ class MainWindow(QMainWindow):
         # 台数提示放在最前面：用户最想知道「这批要跑多久」
         head = f"共 {n} 张　" if n > 1 else ""
         line = f"{head}{spec} · {cost}"
-        if warn:
-            line += "\n⚠ " + warn[0]
+        alert = "⚠ " + " · ".join(warn) if warn else ""
         # 两个页签各有自己的说明行，另一页留空 —— 它当前不参与处理，
         # 摆一行数字只会让人以为那个设置也生效了
         if self.img_tab == 0:
             self.img_cost_info.setText(line)
+            self.img_panel.set_alert(alert)
             self.img_ai_info.setText("")
+            self.img_ai_panel.set_alert("")
         else:
             eng = self.engines.get("esrgan")
             status = "就绪" if eng and eng.ok else "缺失"
-            models = f" · {len(eng.models)} 个模型" if eng and eng.ok else ""
-            self.img_ai_info.setText(line + f"\n超分引擎 {status}{models}")
+            models = f"·{len(eng.models)}模型" if eng and eng.ok else ""
+            self.img_ai_info.setText(line + f" · 超分引擎 {status}{models}")
+            self.img_ai_panel.set_alert(alert)
             self.img_cost_info.setText("")
+            self.img_panel.set_alert("")
 
     # ============================================================ 环境
     def _probe_env(self) -> None:
@@ -3080,6 +3278,7 @@ class MainWindow(QMainWindow):
             bitrate_kbps=self.br_spin.value(),
             audio_mode=self.audio_chips.value() or "aac",
             output_dir=self.out_dir.text().strip(),
+            container=self._export_container or "mp4",
             **params,
         )
 
@@ -3092,7 +3291,7 @@ class MainWindow(QMainWindow):
             crf=18,
             denoise=int(self.ai_denoise_chips.value() or "0"),
             sharpen=int(self.ai_sharpen_chips.value() or "0"),
-            container="mp4",
+            container=self._export_container or "mp4",
             output_dir=self.out_dir.text().strip(),
         )
 
@@ -3135,25 +3334,23 @@ class MainWindow(QMainWindow):
         if rife is not None:
             eng.append(f"补帧 {'就绪' if rife.ok else '缺失'}")
         if vram:
-            eng.append(f"显存 {vram} MB（{profile.tier}档）")
+            eng.append(f"显存 {vram / 1024:.0f}G·{profile.tier}")
         head = " · ".join(eng) if eng else "引擎检测中…"
 
         m = self._current_media()
         if not m or not m.ok:
             self._update_scale_tips(None, profile)
-            self.ai_engine_info.setText(f"{head}\n选择文件后显示输出规格与推荐档位")
+            self.ai_engine_info.setText(f"{head} · 选择文件后显示输出规格")
             self.ai_alert.setText("")
-            self.ai_alert.hide()
             return
 
         self._update_scale_tips(m, profile)
         rec, why = recommend_scale(m, profile)
 
-        # 第二行：推荐哪一档 + 当前设置的实际结果
+        # 灰色行：推荐哪一档 + 当前设置的实际结果（多条提示并成一行）
         if not (s.has_upscale or s.has_interp):
-            self.ai_engine_info.setText(f"{head}\n超分与补帧均已关闭")
+            self.ai_engine_info.setText(f"{head} · 超分与补帧均已关闭")
             self.ai_alert.setText("")
-            self.ai_alert.hide()
             return
 
         tw, th = output_size(m, s)
@@ -3164,7 +3361,7 @@ class MainWindow(QMainWindow):
             bit = f"{tw}×{th}"
             # 推理倍率高于输出倍率时要说清是超采样，否则用户会以为设置没生效
             if inf > s.scale:
-                bit += f"（{inf}× 推理后降采样）"
+                bit += f"（{inf}×推理后降采样）"
             bits.append(bit)
         else:
             bits.append(f"{tw}×{th} 原尺寸")
@@ -3176,7 +3373,9 @@ class MainWindow(QMainWindow):
         # 选了比推荐更高的一档时，把代价直接写在后面 —— 用户点完就看见
         if s.has_upscale and rec and s.scale > rec:
             rec_txt += " · 高于推荐档，更慢更占空间"
-        self.ai_engine_info.setText(f"{head}\n{rec_txt} · 当前 {' · '.join(bits)}")
+        self.ai_engine_info.setText(
+            f"{head} · {rec_txt} · 当前 {' · '.join(bits)}"
+        )
 
         # 警示行：临时空间 —— 这一条比耗时更危险，盘写满会把整台机器拖死
         need = estimate_temp_bytes(m, s, inf, (tw, th))
@@ -3199,6 +3398,7 @@ class MainWindow(QMainWindow):
 
         临时目录优先建在输出目录所在的盘（用户通常已经在那儿腾过空间），
         所以「别把输出放在系统盘」是有实际意义的建议，不是套话。
+        文案压到一行：面板高度不能被撑高，多条提示用「 · 」并排。
         """
         need_mb = need / 1048576
         # 解析成绝对路径再取盘符：相对路径拿不到 drive，会印出一串目录名
@@ -3211,20 +3411,17 @@ class MainWindow(QMainWindow):
         if need_mb:
             if free and need_mb > free:
                 lines.append(
-                    f"⚠ 临时文件约 {need_mb / 1024:.1f} GB，但 {drive} 只剩 "
-                    f"{free / 1024:.1f} GB —— 空间不足，请换一个输出目录"
+                    f"临时约 {need_mb / 1024:.1f} GB，{drive} 仅剩 "
+                    f"{free / 1024:.1f} GB，空间不足，请换输出目录"
                 )
             else:
-                tail = f"（该盘剩余 {free / 1024:.0f} GB）" if free else ""
+                tail = f"（余 {free / 1024:.0f} GB）" if free else ""
                 lines.append(
-                    f"⚠ 处理过程会在 {drive} 产生约 {need_mb / 1024:.1f} GB "
-                    f"临时文件{tail}，做完自动删除。请确认空间够用，输出目录"
-                    "尽量别放系统盘，写满会让整机卡死"
+                    f"临时约 {need_mb / 1024:.1f} GB → {drive}{tail}，做完自动删"
                 )
 
-        lines.extend(f"⚠ {w}" for w in warns)
-        self.ai_alert.setText("\n".join(lines))
-        self.ai_alert.setVisible(bool(lines))
+        lines.extend(warns)
+        self.ai_alert.setText("⚠ " + " · ".join(lines) if lines else "")
 
     def _update_scale_tips(self, m: MediaInfo | None, profile) -> None:
         """给每颗倍率胶囊写一条「选了会得到什么」。
@@ -3266,6 +3463,54 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if d:
             self.out_dir.setText(d)
+
+    # ========================================================== 导出落点
+    def _ask_export(
+        self, mode: str, default_name: str = "", count: int = 1
+    ) -> ExportChoice | None:
+        """AE 式保存对话框：路径 / 文件名 / 保存类型 / 子文件夹。
+
+        每次点导出都弹 —— PDF 的格式选择就住在这里，不弹就永远没机会换格式。
+        确认后的目录写回「输出到」，下一轮预填；取消则什么都不动。
+        """
+        init = self.out_dir.text().strip()
+        if not init:
+            if mode == "video" and self.files:
+                init = str(self.files[0].parent)
+            elif mode == "image" and self.img_files:
+                init = str(self.img_files[0].parent)
+            elif mode == "pdf" and self.pdf_items:
+                init = str(Path(self.pdf_items[0].ref.src).parent)
+        titles = {"video": "导出视频", "image": "导出图片", "pdf": "导出 PDF"}
+        choice = ExportDialog.get_choice(
+            self,
+            title=titles.get(mode, "导出"),
+            mode=mode,
+            default_name=default_name,
+            initial_dir=init,
+        )
+        if choice is None:
+            return None
+        self.out_dir.setText(str(choice.out_dir))
+        return choice
+
+    def _single_name(self, choice: ExportChoice, count: int) -> str | None:
+        """单文件导出且用户输了名字 → 返回「名字.扩展名」；多文件忽略名字。"""
+        if count != 1 or not choice.filename:
+            return None
+        ext = {"mp4": ".mp4", "mkv": ".mkv", "mov": ".mov",
+               "png": ".png", "jpg": ".jpg", "webp": ".webp",
+               "pdf": ".pdf", "pdf_one": ".pdf", "pdf_many": ".pdf"}.get(
+            choice.fmt, ""
+        )
+        return f"{choice.filename}{ext}"
+
+    def _named_output(self, default: Path) -> Path:
+        """用户指定了单文件名就用它（重名自动挂序号），否则按默认规则。"""
+        if not self._single_out_name:
+            return default
+        stem, ext = Path(self._single_out_name).stem, Path(self._single_out_name).suffix
+        return unique_path(default.parent, stem, ext or default.suffix)
 
     # ========================================================== 执行
     def _busy(self) -> bool:
@@ -3421,6 +3666,16 @@ class MainWindow(QMainWindow):
             )
             return
 
+        choice = self._ask_export(
+            "video",
+            default_name=pending[0].stem if len(pending) == 1 else "",
+            count=len(pending),
+        )
+        if choice is None:
+            return
+        self._export_container = choice.fmt
+        self._single_out_name = self._single_name(choice, len(pending))
+
         self.settings = self._collect()
         self._index = -1
         self._cursor = 0
@@ -3477,6 +3732,7 @@ class MainWindow(QMainWindow):
             return
 
         out = make_output_path(path, self.settings, self.settings.encoder)
+        out = self._named_output(out)
         res = build_command(info, self.settings, self.env.ffmpeg, out)
         self._set_progress(0)
         self.runner.start(res.cmd, info.duration)
@@ -3641,6 +3897,29 @@ class MainWindow(QMainWindow):
             )
             return
 
+        choice = self._ask_export(
+            "image",
+            default_name=batch[0].stem if len(batch) == 1 else "图片",
+            count=len(batch),
+        )
+        if choice is None:
+            return
+        self._single_out_name = self._single_name(choice, len(batch))
+        if choice.fmt == "pdf":
+            # 全部合成一个 PDF：每张图照常按面板参数处理（输出进临时目录），
+            # 全部跑完再装订成册
+            import tempfile as _tempfile
+
+            stem = choice.filename or "合并"
+            self._img_pdf_target = unique_path(choice.out_dir, stem, ".pdf")
+            self._img_pdf_tmp = Path(_tempfile.mkdtemp(prefix="zzbox_imgpdf_"))
+            self._img_pdf_files = []
+        else:
+            # 保存类型写回格式面板，队列「导出格式」列跟实际落盘一致
+            chips = self.img_ai_fmt if self.img_tab == 1 else self.img_fmt_chips
+            if chips.button(choice.fmt) is not None:
+                chips.set_value(choice.fmt, emit=True)
+
         for p in batch:
             st = self._img_state(p)
             st.phase, st.status, st.tip = "ready", "", ""
@@ -3675,6 +3954,15 @@ class MainWindow(QMainWindow):
 
             s = self._collect_img()
             out_hint = ""
+            # 落点改道：PDF 装订中间件 → 临时目录；单文件用户指定名 → 用它
+            out_path: Path | None = None
+            if self._img_pdf_target is not None and self._img_pdf_tmp is not None:
+                s = replace(s, fmt="png")   # 无损中间件，装订时再按质量压
+                out_path = self._img_pdf_tmp / f"{len(self._img_pdf_files):04d}.png"
+            elif self._single_out_name:
+                out_path = self._named_output(
+                    Path(s.output_dir or path.parent) / self._single_out_name
+                )
             if s.has_ai:
                 eng = self.engines.get("esrgan")
                 # 中间文件路径要提前算出来：build_ai_steps 需要它，
@@ -3689,13 +3977,17 @@ class MainWindow(QMainWindow):
                     s,
                     info,
                     tmp,
+                    out_path=out_path,
                 )
                 cleanups = [tmp]
             else:
                 steps, out, err = build_compress_steps(
-                    self.env.ffmpeg, path, s, info
+                    self.env.ffmpeg, path, s, info, out_path=out_path
                 )
                 cleanups = []
+            if out_path is not None and out and str(out):
+                if self._img_pdf_target is not None:
+                    self._img_pdf_files.append(Path(out))
 
             if err or not steps:
                 st.phase, st.status, st.tip = "failed", "参数有误", err or "无法构造命令"
@@ -3759,7 +4051,9 @@ class MainWindow(QMainWindow):
         self._img_index = 0
         self._set_running(False)
         self._img_refresh_count()
-        if self._img_ok or self._img_fail:
+        if self._img_pdf_target is not None:
+            self._img_bind_pdf(secs)
+        elif self._img_ok or self._img_fail:
             tail = f" · 失败 {self._img_fail}" if self._img_fail else ""
             self.current_label.setText(f"完成 {self._img_ok} 张{tail}")
             # 压缩一张图往往不到 1 秒，写「用时 0 秒」看着像没干活
@@ -3770,6 +4064,39 @@ class MainWindow(QMainWindow):
             self.current_label.setText("就绪")
             self.stats_label.setText("")
         self._sync_tray()
+
+    def _img_bind_pdf(self, secs: float) -> None:
+        """处理完的中间图装订成一个 PDF，然后清掉临时目录。"""
+        target = self._img_pdf_target
+        files = [p for p in self._img_pdf_files if p.exists()]
+        tmp = self._img_pdf_tmp
+        self._img_pdf_target = None
+        self._img_pdf_files = []
+        self._img_pdf_tmp = None
+        try:
+            if target is None:
+                return
+            if not files:
+                self.current_label.setText("没有可装订的图片")
+                self.stats_label.setText("PDF 未生成")
+                return
+            q = self.img_quality_slider.value() if self.img_tab == 0 else 85
+            merge_images_to_pdf(files, target, quality=q)
+            tail = f" · 失败 {self._img_fail}" if self._img_fail else ""
+            self.current_label.setText(
+                f"已合成 PDF：{target.name}（{len(files)} 页）{tail}"
+            )
+            self.stats_label.setText(
+                f"{target} · 用时 {'<1 秒' if secs < 1 else f'{secs:.0f} 秒'}"
+            )
+            if not self.isVisible() and self.tray:
+                self.tray.notify("PDF 已合成", f"{target.name}（{len(files)} 页）")
+        except Exception as exc:
+            self.current_label.setText("PDF 装订失败")
+            self.stats_label.setText(str(exc))
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
 
     # ========================================================== 音频工具
     # 抽取音频 / 删除音轨：都是批量任务，和压制共用同一个执行器串行跑
@@ -3988,6 +4315,17 @@ class MainWindow(QMainWindow):
             )
             return
 
+        choice = self._ask_export(
+            "video",
+            default_name=pending[0].stem if len(pending) == 1 else "",
+            count=len(pending),
+        )
+        if choice is None:
+            return
+        self._export_container = choice.fmt
+        self._single_out_name = self._single_name(choice, len(pending))
+        s = self._collect_ai()
+
         # 先把所有待处理文件读一遍，算出临时空间的峰值需求
         pairs: list[tuple[Path, MediaInfo]] = []
         worst = 0
@@ -4045,12 +4383,18 @@ class MainWindow(QMainWindow):
         jobs: list[dict] = []
         vram = self.env.vram_mb or 0
         for i, (path, info) in enumerate(pairs):
+            out_override = None
+            if self._single_out_name:
+                out_override = self._named_output(
+                    Path(s.output_dir or path.parent) / self._single_out_name
+                )
             plan = build_plan(
                 info,
                 s,
                 self.engines,
                 self.env.ffmpeg,
                 root / f"{i:02d}",
+                output=out_override,
                 vram_mb=vram,
             )
             if plan.error:

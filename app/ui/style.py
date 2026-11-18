@@ -15,6 +15,7 @@ BLUE_LIGHT = "#85b7eb"
 TRACK = "#2f2f35"
 QUEUE_BG = "#1f1f24"      # 队列表格底色（操作列自绘背景要和它一致）
 ROW_SEL = "#22303f"       # 选中行底色
+ROW_HOVER = "#27272d"     # 悬停行底色（整行，包括操作列）
 ROW_LINE = "#2e2e37"      # 行分隔线
 
 OK_COLOR = "#5dcaa5"
@@ -182,14 +183,25 @@ QTableWidget#queueTable {{
     color: {TEXT};
 }}
 QTableWidget#queueTable::item {{
+    /* 行底和行分隔线由 QueueTable 在视口里整行画：QSS 的 item 覆盖不到
+       「操作」列（那列是 cellWidget），逐格 setBackground 也会被样式表吃掉 */
     border: none;
-    border-bottom: 1px solid {ROW_LINE};
     padding: 0px 10px;
 }}
-QTableWidget#queueTable::item:hover {{ background: #27272d; }}
+/* 悬停不在这里画：QSS 的 :hover 只亮鼠标下那一个格子，整行悬停由
+   QueueTable 在视口里自绘 */
 QTableWidget#queueTable::item:selected {{
+    /* 这一格也不得不给具体颜色：写 transparent 时 Qt 会退回 Fusion 调色板
+       的高亮蓝（#308cc6）。给的就是整行选中色，和视口自绘的那一层同色，
+       拼起来看不出接缝 */
     background: {ROW_SEL};
     color: {TEXT};
+}}
+/* 拖动排序的落点提示线：2px，用的是和选中胶囊同一个强调蓝 */
+QFrame#dropline {{
+    background: {ACCENT};
+    border: none;
+    border-radius: 1px;
 }}
 QHeaderView {{ background: transparent; }}
 QHeaderView::section {{
@@ -281,37 +293,28 @@ QMenu::separator {{
     margin: 5px 8px;
 }}
 
-/* ---- 属性页页签：仿 Windows 属性对话框 ----
-   未选中的页签是一块比背景稍亮的底 + 三面细边；选中的页签底色换成与内容区
-   相同的 BG，让人眼把它和下面那块内容读成同一个面。底部那根线由
-   _TabStrip.paintEvent 画（并在活动页签处断开），所以这里一律不给
-   border-bottom，否则会出现第二条线。 */
+/* ---- 属性页页签：扁平胶囊 + 圆角内容卡 ----
+   原设计是 Windows 属性对话框那种「页签和内容面板连成一体」：内容区画
+   方角边框、页签下画贯穿线并在活动页签处断开。但内容卡是圆角的 ——
+   直线和方角在圆角外露出来，就是用户说的「圆角框外多一个直角框」。
+   现在只保留圆角内容卡这一层边框，页签改成扁平胶囊。 */
 QPushButton#ptab {{
-    background: {HEADER};
-    border-top: 1px solid #2a2a30;
-    border-left: 1px solid #2a2a30;
-    border-right: 1px solid #2a2a30;
-    border-bottom: none;
-    border-radius: 0px;
-    padding: 0px;
+    background: transparent;
+    border: none;
+    border-radius: 7px;
+    padding: 5px 18px;
     color: {MUTED};
     font-size: 12px;
 }}
 QPushButton#ptab:hover {{ color: {TEXT}; background: #26262b; }}
 QPushButton#ptab:checked {{
-    background: {BG};
-    border-top: 1px solid {BORDER_STRONG};
-    border-left: 1px solid {BORDER_STRONG};
-    border-right: 1px solid {BORDER_STRONG};
-    border-bottom: none;
+    background: #2c2c33;
     color: {TEXT};
+    font-weight: 500;
 }}
 QStackedWidget#ptabpane {{
-    background: {BG};
-    border-top: none;
-    border-left: 1px solid {BORDER_STRONG};
-    border-right: 1px solid {BORDER_STRONG};
-    border-bottom: 1px solid {BORDER_STRONG};
+    background: transparent;
+    border: none;
 }}
 """
 

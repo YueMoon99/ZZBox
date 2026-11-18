@@ -5,8 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter
+from PySide6.QtCore import (
+    QItemSelection,
+    QItemSelectionModel,
+    QMimeData,
+    QPoint,
+    QRect,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QBrush, QColor, QDrag, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -87,7 +97,14 @@ class Card(QFrame):
 
 
 class ChipGroup(QWidget):
-    """互斥的胶囊按钮组，可附加一个尾随控件（如自定义输入框）。"""
+    """互斥的胶囊按钮组，可附加一个尾随控件（如自定义输入框）。
+
+    ``fill=True`` 用于「参数表」式的网格（OptionPanel 的单元格）：这一组
+    按钮平分单元格宽度，于是同一列上下两行的按钮组总宽恒等、最右侧边缘
+    严丝合缝地对齐 —— 4 个按钮的「超分」和 3 个按钮的「编码」右边缘落在
+    同一条竖线上，看起来像一张表而不是两排参差不齐的胶囊。
+    ``fill=False`` 时保持原来的定宽行为（按钮按最宽的那个字块统一宽度）。
+    """
 
     changed = Signal(str)
 
@@ -96,6 +113,7 @@ class ChipGroup(QWidget):
         options: list[tuple[str, str]],
         parent: QWidget | None = None,
         stretch: bool = True,
+        fill: bool = False,
     ):
         super().__init__(parent)
         lay = QHBoxLayout(self)
@@ -110,9 +128,27 @@ class ChipGroup(QWidget):
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _=False, k=key: self._select(k))
             self._group.addButton(btn)
-            lay.addWidget(btn)
+            # fill 模式下每个按钮拿同样的伸缩因子，多余宽度才严格均分，
+            # 不会出现「谁字多谁多占」的偏差
+            lay.addWidget(btn, 1 if fill else 0)
             self._buttons[key] = btn
-        if stretch:
+        # 胶囊统一尺寸：组内等宽、全局等高，看起来像一套控件而不是
+        # 「谁字多谁胖」的杂牌军。宽度下限 72px，短字块（关/2×）随长板拉齐。
+        if self._buttons:
+            w = max(
+                72, max(b.sizeHint().width() for b in self._buttons.values())
+            )
+            for b in self._buttons.values():
+                b.setFixedHeight(28)
+                if fill:
+                    # 只钉下限，宽度交给布局去均分；上限放开才拉得动
+                    b.setMinimumWidth(w)
+                    b.setMaximumWidth(16777215)
+                    b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                else:
+                    b.setFixedWidth(w)
+        if stretch and not fill:
+            # fill 模式下按钮自己吃满整格，再来个弹簧就会把按钮挤扁
             lay.addStretch(1)
         self._value = options[0][0] if options else ""
         if options:
@@ -163,11 +199,12 @@ class ChipGroup(QWidget):
 
 
 class _TabStrip(QWidget):
-    """页签条：自己画那条贯穿底部的分隔线，并在活动页签处断开。
+    """页签条：一组扁平页签按钮。
 
-    断开这一笔是整个「属性对话框」观感的关键——活动页签的底色和下方内容区
-    连成一片，看上去才像同一个面。交给样式表是做不到的（QSS 没有「在某个
-    子控件位置截断边框」这种能力），所以只能自己画。
+    原来这里会画一条贯穿底部、并在活动页签处断开的分隔线，让页签和内容区
+    连成一体（Windows 属性对话框观感）。但内容区是一张圆角卡片 ——
+    直线在圆角外面横过去，看起来就是「圆角框外多了一个直角框」。现在
+    内容只保留圆角卡片这一层边框，页签改成扁平胶囊，不再画线。
     """
 
     TAB_H = 30
@@ -204,24 +241,6 @@ class _TabStrip(QWidget):
     def set_active(self, index: int) -> None:
         self._active = index
         self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        y = self.height() - 1
-        color = QColor(style.BORDER_STRONG)
-        btn = (
-            self._buttons[self._active]
-            if 0 <= self._active < len(self._buttons)
-            else None
-        )
-        if btn is None:
-            painter.fillRect(0, y, self.width(), 1, color)
-            return
-        g = btn.geometry()
-        painter.fillRect(0, y, max(0, g.left()), 1, color)
-        painter.fillRect(
-            g.right() + 1, y, max(0, self.width() - g.right() - 1), 1, color
-        )
 
 
 class PropertyTabs(QWidget):
@@ -287,6 +306,97 @@ class PropertyTabs(QWidget):
         return None
 
 
+class HintLine(QLabel):
+    """面板底部的单行提示：高度钉死一行，放不下就横向滚动播放。
+
+    面板高度绝不能因为提示文字出现/清空/换行而变化 —— 导入文件时黄色
+    警告突然冒出来把面板撑高、队列被挤扁，就是这么来的。所以这里：
+      · 高度固定一行，永远不换行；
+      · 多条提示由调用方合并成一行（「 · 」连接）；
+      · 超宽就整行跑马灯滚动，不撑高、不裁切。
+    """
+
+    SCROLL_SPEED = 1      # 每帧像素
+    SCROLL_GAP = 48       # 首尾相接时的空隙
+
+    def __init__(
+        self,
+        text: str = "",
+        color: str | None = None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(text, parent)
+        self._full = text or ""
+        self._color = color or style.DIM
+        self._offset = 0
+        self.setFixedHeight(18)
+        self.setWordWrap(False)
+        self._timer = QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._tick)
+
+    # ------------------------------------------------------------------
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full = text or ""
+        self._offset = 0
+        super().setText(self._full)
+        self._sync_timer()
+        self.update()
+
+    def _text_width(self) -> int:
+        return self.fontMetrics().horizontalAdvance(self._full)
+
+    def _overflow(self) -> bool:
+        return bool(self._full) and self._text_width() > self.width() - 4
+
+    def _sync_timer(self) -> None:
+        if self._overflow():
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._offset = 0
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._sync_timer()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._sync_timer()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def _tick(self) -> None:
+        self._offset += self.SCROLL_SPEED
+        if self._offset > self._text_width() + self.SCROLL_GAP:
+            self._offset = 0
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        if not self._full:
+            return
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        painter.setPen(QColor(self._color))
+        rect = QRect(0, 0, self.width(), self.height())
+        if not self._overflow():
+            painter.drawText(
+                rect.adjusted(2, 0, -2, 0), Qt.AlignLeft | Qt.AlignVCenter, self._full
+            )
+            return
+        # 超宽：跑马灯，两份文字首尾相接循环滚动
+        step = self._text_width() + self.SCROLL_GAP
+        x = -self._offset
+        for i in (0, 1):
+            painter.drawText(
+                QRect(x + i * step, 0, self._text_width() + 4, self.height()),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                self._full,
+            )
+
+
 class OptionPanel(QFrame):
     """集成化参数面板：一张扁卡片，内部按「标签 + 控件」铺成网格。
 
@@ -294,7 +404,12 @@ class OptionPanel(QFrame):
     装饰就吃掉一百多像素 —— 那是整整三条队列的高度。参数本身一行就够，
     说明挪进 tooltip，视觉上从「四个盒子」变成一个「参数表」，队列因此
     多出三四行可见区域。
+
+    底部提示区固定两行（灰色一行 + 黄色一行），高度永远不变：文字出现、
+    清空都不许把面板撑高，否则导入文件时队列突然变矮一截。
     """
+
+    HINT_H = 18
 
     def __init__(self, cols: int = 2, parent: QWidget | None = None):
         super().__init__(parent)
@@ -316,17 +431,14 @@ class OptionPanel(QFrame):
         for c in range(self._cols):
             self._grid.setColumnStretch(c, 1)
 
-        self.note = QLabel("")
+        # 提示区恒定两行：灰色一行（规格/状态）+ 黄色一行（警示）。
+        # 两行始终占位 —— 空的那行留白，不让面板高度跟着文字跳。
+        self.note = HintLine("", color=style.DIM)
         self.note.setObjectName("hint")
-        self.note.setWordWrap(True)
         outer.addWidget(self.note)
 
-        # 警示行：临时空间不足、显存吃紧这类「动手前必须看一眼」的话。
-        # 默认隐藏 —— 常态下不占高度，出现时才顶掉一行队列。
-        self.alert = QLabel("")
+        self.alert = HintLine("", color=style.WARN_COLOR)
         self.alert.setObjectName("alert")
-        self.alert.setWordWrap(True)
-        self.alert.hide()
         outer.addWidget(self.alert)
         # 两个页签的参数行数不同（压缩页 2 行、AI 页 3 行），stack 会把
         # 矮的那页拉到高的那页的高度。多余空间给这个弹簧，参数就钉在上方，
@@ -366,9 +478,18 @@ class OptionPanel(QFrame):
         self.note.setText(text)
 
     def set_alert(self, text: str) -> None:
-        """设置警示行；传空串即隐藏。"""
+        """设置黄色警示行；传空串只清文字 —— 行本身常驻，高度不变。"""
         self.alert.setText(text)
-        self.alert.setVisible(bool(text))
+
+    def pin_height(self) -> None:
+        """把面板总高钉死在当前 sizeHint 上。
+
+        提示行已经是固定高度，这里再加一道保险：之后任何文字变化
+        （哪怕未来有人忘了改回单行）都不会把面板撑高、挤扁队列。
+        """
+        h = self.sizeHint().height()
+        if h > 0:
+            self.setFixedHeight(h)
 
 
 QUEUE_COLUMNS = ("文件名", "原始格式", "导出格式", "原始大小", "预计导出大小", "操作")
@@ -388,6 +509,9 @@ class RowActions(QWidget):
     lock_clicked = Signal(object)
     retry_clicked = Signal(object)
     delete_clicked = Signal(object)
+    # 指针进出这一格（含格内的三个按钮）：鼠标停在操作列上时表格收不到
+    # mouseMove，整行悬停得靠这里补上，否则高亮会僵在刚离开的那一行
+    hover_changed = Signal(object, bool)
 
     PAD_L = 0           # 单元格控件的左右留白已由样式表的 item padding 提供
     PAD_R = 0
@@ -404,6 +528,7 @@ class RowActions(QWidget):
         self.path = path
         self._text = "就绪"
         self._selected = False
+        self._hover = False
 
         self.dot = QLabel(self)
         self.dot.setFixedSize(self.DOT, self.DOT)
@@ -478,20 +603,33 @@ class RowActions(QWidget):
         super().resizeEvent(event)
         self._place()
 
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self.hover_changed.emit(self.path, True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.hover_changed.emit(self.path, False)
+        super().leaveEvent(event)
+
     def set_selected(self, on: bool) -> None:
-        """操作列是 cellWidget，盖在单元格上面，选中色得自己画。"""
+        """记下选中态。
+
+        底色不在这里画 —— 操作列是盖在视口上的 cellWidget，自己填色只能填
+        它那块（还被 QSS 的 item padding 内缩了 10px），和整行底色对不上，
+        看起来就是「只有操作区中间那一小块变色」。整行底色统一由
+        QueueTable 在视口里画，这里保持透明，底下的颜色直接透上来。
+        """
         if on == self._selected:
             return
         self._selected = on
         self.update()
 
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.fillRect(
-            self.rect(), QColor(style.ROW_SEL if self._selected else style.QUEUE_BG)
-        )
-        # 行与行之间的细线由 item 的 border 提供，这里补上同一根，别断在操作列
-        painter.fillRect(0, self.height() - 1, self.width(), 1, QColor(style.ROW_LINE))
+    def set_hover(self, on: bool) -> None:
+        """整行悬停状态（底色同样交给视口画，这里只留状态）。"""
+        if on == self._hover:
+            return
+        self._hover = on
+        self.update()
 
     # ------------------------------------------------------------------
     def apply(self, st: RowState) -> None:
@@ -547,6 +685,8 @@ class QueueTable(QTableWidget):
     """
 
     reordered = Signal(int, int)
+    # 按下 Delete 键：由主窗口接去执行真正的删除（含确认/撤销等业务规则）
+    delete_pressed = Signal()
 
     def __init__(
         self,
@@ -581,12 +721,15 @@ class QueueTable(QTableWidget):
         # 横向永远不滚动：列宽总和不许超过视口，否则最右边的操作按钮会被
         # 推到看不见的地方（拖回来之前一直是残的）。拖不动就顶住，别溢出。
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # 不给焦点框：点完行内按钮后整行外面套一圈虚线很难看
-        self.setFocusPolicy(Qt.NoFocus)
+        # 点进来就能用 Delete 删选中项 —— NoFocus 收不到键盘。焦点框靠样式表
+        # 的 outline:none 压掉，不会再出现「点完行按钮套一圈虚线」
+        self.setFocusPolicy(Qt.ClickFocus)
 
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
+        # 默认的落点提示线是系统画的一条 1px 黑线，既看不见又会被操作列的
+        # cellWidget 盖掉半截。改成自己画：整行宽、2px 强调色蓝。
+        self.setDropIndicatorShown(False)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setDragDropOverwriteMode(False)
@@ -629,6 +772,21 @@ class QueueTable(QTableWidget):
         self._rb_origin = QPoint()
         self._rb_base: set[int] = set()
         self.itemSelectionChanged.connect(self._sync_row_bg)
+        # 整行悬停：QSS 的 :hover 只亮鼠标下那一格，自己跟踪行号统一刷底色
+        self._hover_row = -1
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        # 拖拽预览的热点：按下时指针在视口里的横坐标
+        self._drag_press_x = -1
+
+        # 拖动排序的落点提示线：单独一个薄条压在视口最上层。
+        # 不能靠视口自绘 —— 操作列的 cellWidget 是视口的子控件，子控件永远
+        # 画在父控件之后，线到了那一列就会被盖掉，只剩两侧各 10px 的碎点。
+        self._drop_line = QFrame(self.viewport())
+        self._drop_line.setObjectName("dropline")
+        self._drop_line.setFixedHeight(2)
+        self._drop_line.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._drop_line.hide()
 
     # 各列的伸缩底线：拖到这里就顶住，不许再窄
     MIN_NAME = 150
@@ -762,9 +920,13 @@ class QueueTable(QTableWidget):
                 self.setItem(i, col, item)
                 items.append(item)
             actions = RowActions(path)
+            actions.hover_changed.connect(
+                lambda _p, on, r=i: self._set_hover_row(r if on else -1)
+            )
             self.setCellWidget(i, COL_OPS, actions)
             cells.append(RowCells(items, actions))
         self.blockSignals(False)
+        self._hover_row = -1
         self._sync_row_bg()
         return cells
 
@@ -803,10 +965,153 @@ class QueueTable(QTableWidget):
             w = self.cellWidget(r, COL_OPS)
             if isinstance(w, RowActions):
                 w.set_selected(r in rows)
+                w.set_hover(r == self._hover_row)
+        self.viewport().update()
+
+    # ------------------------------------------------------------------ 悬停
+    def _set_hover_row(self, row: int) -> None:
+        """整行悬停：底色由视口一次画满整行。
+
+        以前是逐格 item.setBackground()，在带 QSS「::item」规则的表格里那层
+        brush 根本不参与绘制（样式表接管了格子的绘制），只有操作列的
+        cellWidget 自己填了色 —— 于是悬停看过去就是「操作区中间亮了一条」。
+        现在统一改成视口自绘 + 操作列保持透明，整行同色，一格不少。
+        """
+        if row == self._hover_row:
+            return
+        old, self._hover_row = self._hover_row, row
+        for r in {old, row}:
+            if not (0 <= r < self.rowCount()):
+                continue
+            w = self.cellWidget(r, COL_OPS)
+            if isinstance(w, RowActions):
+                w.set_hover(r == row)
+        self.viewport().update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        # 底色画在下层（否则字被盖住），行分隔线画在上层（否则被选中格的
+        # 底色吃掉最后 1px，整行看过去就是断在中间）
+        self._paint_row_bg()
+        super().paintEvent(event)
+        self._paint_row_lines()
+
+    def _rows_on_screen(self) -> list[tuple[int, int, int]]:
+        """(行号, 视口内顶边, 行高)，只返回当前可视范围内的行。"""
+        out: list[tuple[int, int, int]] = []
+        vh = self.viewport().height()
+        for r in range(self.rowCount()):
+            top = self.rowViewportPosition(r)
+            h = self.rowHeight(r)
+            if top + h < 0:
+                continue
+            if top > vh:
+                break
+            out.append((r, top, h))
+        return out
+
+    def _paint_row_bg(self) -> None:
+        """整行底色：选中 > 悬停。
+
+        自己画而不是交给 QSS 的 ::item，有两个原因：
+          · 「操作」列没有 item，只有 cellWidget，QSS 画不到那一格；
+          · cellWidget 被 item padding 内缩了 10px，底色自己填就会和内缩
+            边界对不齐，露出两截不同颜色的缝。
+        """
+        rows = set(self.selected_rows())
+        if not rows and self._hover_row < 0:
+            return
+        painter = QPainter(self.viewport())
+        try:
+            width = self.viewport().width()
+            for r, top, h in self._rows_on_screen():
+                if r in rows:
+                    bg = style.ROW_SEL
+                elif r == self._hover_row:
+                    bg = style.ROW_HOVER
+                else:
+                    continue
+                painter.fillRect(0, top, width, h, QColor(bg))
+        finally:
+            painter.end()
+
+    def _paint_row_lines(self) -> None:
+        """行分隔线：贯穿整行（含操作列），不在列边界处断开。"""
+        if self.rowCount() == 0:
+            return
+        painter = QPainter(self.viewport())
+        try:
+            width = self.viewport().width()
+            for _r, top, h in self._rows_on_screen():
+                painter.fillRect(0, top + h - 1, width, 1, QColor(style.ROW_LINE))
+        finally:
+            painter.end()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._set_hover_row(-1)
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        # Delete 删除选中行；具体怎么删（跳过正在处理的、刷新计数）归主窗口
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.selected_rows():
+            self.delete_pressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------ 拖拽
+    def startDrag(self, supportedActions) -> None:  # noqa: N802
+        """自己造拖拽预览，别用 Qt 默认那个。
+
+        默认 startDrag 会把选中格子 renderToPixmap —— 在这套样式表 + cellWidget
+        的表格上渲出来是个错位的蓝色空框，挂在指针右边一大截。这里改成把被拖的
+        那一行截下来做成半透明小预览卡，热点钉在按下位置，稳稳跟在指针下。
+        """
+        rows = self.selected_rows()
+        if not rows:
+            return
+        row = rows[0]
+        indexes = [
+            self.model().index(r, c)
+            for r in rows
+            for c in range(self.columnCount())
+        ]
+        mime = self.model().mimeData(indexes)
+        if mime is None:
+            mime = QMimeData()
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pix = self._drag_preview(row)
+        if not pix.isNull():
+            drag.setPixmap(pix)
+            # 热点：按下列内位置（横坐标缩放到预览图上），松手前预览一直贴着指针
+            press_x = self._drag_press_x if self._drag_press_x >= 0 else pix.width() // 2
+            scale = pix.width() / max(1, self.viewport().width())
+            drag.setHotSpot(QPoint(int(press_x * scale), pix.height() // 2))
+        drag.exec(Qt.MoveAction)
+
+    def _drag_preview(self, row: int) -> QPixmap:
+        """把整行截成一张半透明预览图；太宽就等比缩小，免得遮住半屏。"""
+        top = self.rowViewportPosition(row)
+        rect = QRect(0, top, self.viewport().width(), self.rowHeight(row))
+        grab = self.viewport().grab(rect)
+        if grab.isNull():
+            return grab
+        max_w = 320
+        if grab.width() > max_w:
+            grab = grab.scaledToWidth(max_w, Qt.SmoothTransformation)
+        out = QPixmap(grab.size())
+        out.fill(Qt.transparent)
+        p = QPainter(out)
+        p.setOpacity(0.92)
+        p.drawPixmap(0, 0, grab)
+        p.end()
+        return out
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         # 在空白区按下：拉橡皮筋框选。Qt 自带的框选会被拖拽重排抢走鼠标，
         # 这里自己接管，行为反而更接近资源管理器。
+        self._drag_press_x = int(event.position().x())
         if event.button() == Qt.LeftButton and not self.indexAt(
             event.position().toPoint()
         ).isValid():
@@ -829,6 +1134,7 @@ class QueueTable(QTableWidget):
             self._rubber_select(rect)
             event.accept()
             return
+        self._set_hover_row(self.rowAt(event.position().toPoint().y()))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
@@ -864,7 +1170,53 @@ class QueueTable(QTableWidget):
             sm.setCurrentIndex(self.model().index(min(rows), 0), QItemSelectionModel.NoUpdate)
 
     # ------------------------------------------------------------------
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        super().dragMoveEvent(event)
+        if event.source() is not self:
+            self._hide_drop_line()
+            return
+        pos = event.position()
+        if hasattr(pos, "toPoint"):
+            pos = pos.toPoint()
+        self._place_drop_line(pos)
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._hide_drop_line()
+        super().dragLeaveEvent(event)
+
+    def _hide_drop_line(self) -> None:
+        if self._drop_line.isVisible():
+            self._drop_line.hide()
+
+    def _place_drop_line(self, pos: QPoint) -> None:
+        """把蓝色提示线放到「松手后会落在哪一行的哪一侧」。
+
+        指针在上半行 → 线压在这一行的上边缘，下半行 → 压在下一行上边缘，
+        和 dropEvent 里 indexAt() 得出的落点行一致。
+        """
+        if self.rowCount() == 0:
+            self._hide_drop_line()
+            return
+        index = self.indexAt(pos)
+        if index.isValid():
+            r = index.row()
+            top = self.rowViewportPosition(r)
+            h = self.rowHeight(r)
+            y = top if pos.y() < top + h // 2 else top + h
+        else:
+            # 落在空白区：接在最后一行之后
+            last = self.rowCount() - 1
+            y = self.rowViewportPosition(last) + self.rowHeight(last)
+        vp = self.viewport()
+        # 2px 的线骑在行边界上，上下各占 1px，不遮挡任何一行文字
+        y = max(0, min(y - 1, vp.height() - self._drop_line.height()))
+        self._drop_line.setGeometry(0, y, vp.width(), self._drop_line.height())
+        # cellWidget 也是视口的子控件，必须显式抬到最上层才不会被盖住
+        self._drop_line.raise_()
+        self._drop_line.show()
+
     def dropEvent(self, event) -> None:  # noqa: N802
+        self._hide_drop_line()
         # 从资源管理器拖文件进来时，交给主窗口统一处理，别被表格吞掉
         if event.source() is not self:
             event.ignore()

@@ -56,8 +56,14 @@ UID_ROLE = Qt.UserRole + 1
 # 拼进文本，是因为它要单独控制字号和颜色，而且随时可能被估算结果刷新
 SUB_ROLE = Qt.UserRole + 2
 SUB_TONE_ROLE = Qt.UserRole + 3
-# 缩略图右上角的绿色小角标（如「已压缩」）。空字符串就是不画。
+# 缩略图右上角的小角标（如「已压缩」绿 / 「不可压缩」黄）。空字符串就是不画。
 BADGE_ROLE = Qt.UserRole + 4
+BADGE_TONE_ROLE = Qt.UserRole + 5
+# 角标配色：绿底白字（成功）/ 黄底深字（警示）
+_BADGE_COLORS = {
+    "ok": ("#2f9e63", "#ffffff"),
+    "warn": ("#e8b21c", "#3f2d00"),
+}
 
 
 class _PageDelegate(QStyledItemDelegate):
@@ -108,9 +114,10 @@ class _PageDelegate(QStyledItemDelegate):
                 painter, target, Qt.AlignCenter, QIcon.Normal, QIcon.Off
             )
 
-        # ---- 右上角绿色角标（「已压缩」）：贴着缩略图右上，压在图上
+        # ---- 右上角小角标（「已压缩」绿 / 「不可压缩」黄）：贴着缩略图右上，压在图上
         badge = index.data(BADGE_ROLE) or ""
         if badge and icon_target is not None:
+            tone = index.data(BADGE_TONE_ROLE) or "ok"
             bf = QFont(option.font)
             bf.setPixelSize(9)
             bf.setBold(True)
@@ -121,9 +128,10 @@ class _PageDelegate(QStyledItemDelegate):
             bx = icon_target.right() - bw + 4   # 稍微探出卡片右缘，像截图那样
             by = icon_target.top() - 2
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#2f9e63"))   # 绿底
+            bg, fg = _BADGE_COLORS.get(tone, _BADGE_COLORS["ok"])
+            painter.setBrush(QColor(bg))
             painter.drawRoundedRect(QRect(bx, by, bw, bh), 4, 4)
-            painter.setPen(QColor("#ffffff"))    # 白字
+            painter.setPen(QColor(fg))
             painter.drawText(QRect(bx, by, bw, bh), Qt.AlignCenter, str(badge))
 
         # ---- 两行字
@@ -182,6 +190,7 @@ class PageGrid(QListWidget):
     order_changed = Signal(list)      # 排序变化后新的 uid 顺序
     zoom_changed = Signal(int)        # 当前单格宽度
     context_requested = Signal(object, object)  # (选中的 uid 列表, 全局坐标)
+    delete_requested = Signal()       # Delete 键：删掉选中的格子
 
     ZOOM_MIN = 92
     ZOOM_MAX = 268
@@ -323,12 +332,14 @@ class PageGrid(QListWidget):
         tip = item.toolTip().split("\n")[0]
         item.setToolTip(f"{tip}\n{text}" if text else tip)
 
-    def set_badge(self, uid: str, text: str) -> None:
-        """缩略图右上角的角标。空字符串清除；改动会触发重绘。"""
+    def set_badge(self, uid: str, text: str, tone: str = "ok") -> None:
+        """缩略图右上角的角标。tone=ok 绿底（已压缩）/ warn 黄底（不可压缩）。
+        空字符串清除；改动会触发重绘。"""
         item = self._item_of(uid)
         if item is None:
             return
         item.setData(BADGE_ROLE, text)
+        item.setData(BADGE_TONE_ROLE, tone)
         self.viewport().update()
 
     def set_thumb(self, uid: str, png: bytes) -> None:
@@ -539,6 +550,11 @@ class PageGrid(QListWidget):
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if self._dragging and event.key() == Qt.Key_Escape:
             self._reset_drag()      # Esc 放弃这次拖动，顺序不动
+            event.accept()
+            return
+        # Delete 删选中格子，和队列表格一致；真正删除走主窗口（要压撤销快照）
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.selected_uids():
+            self.delete_requested.emit()
             event.accept()
             return
         super().keyPressEvent(event)

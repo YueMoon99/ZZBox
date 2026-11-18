@@ -125,7 +125,7 @@ def main() -> None:
     check("第 1 页有可压图片", stats[0].compressible, stats[0].label())
     check("第 1 页统计到原始字节", stats[0].cur_bytes > 300_000,
           f"{stats[0].cur_bytes / 1024:.0f} KB")
-    check("第 2 页判为无图片", stats[1].reason == "本页无图片", stats[1].reason)
+    check("第 2 页判为无图片", stats[1].reason == "本页无位图（矢量/文字）", stats[1].reason)
     # 透明图（带 SMask）以前整张跳过，现在只压颜色通道、蒙版原样保留
     check("第 3 页的透明图照常可压",
           stats[2].compressible and stats[2].skipped == 0,

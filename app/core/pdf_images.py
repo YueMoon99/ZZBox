@@ -79,6 +79,7 @@ class PageStat:
     cur_bytes: int = 0          # 这些图片当前占多少字节
     est_bytes: int = 0          # 按当前质量压完占多少（未估算时为 0）
     skipped: int = 0            # 被跳过的图片张数
+    skipped_bytes: int = 0      # 被跳过的图片共占多少字节
     reason: str = ""            # 整页不可压的原因，给界面直接显示
 
     @property
@@ -107,6 +108,20 @@ def _human(n: float) -> str:
             v = n / base
             return f"{v:.0f} {unit}" if v >= 10 else f"{v:.1f} {unit}"
     return f"{int(n)} B"
+
+
+def _no_compress_reason(st: "PageStat") -> str:
+    """一页压不动时，格子下面那行字要说清楚为什么。
+
+    - 一张位图都没有：多半是矢量图表/纯文字页，看着有颜色也是路径画的
+    - 有图但全被跳过：带上体积，用户一眼能看出"图本来就小，压不动"
+    """
+    if not st.skipped:
+        return "本页无位图（矢量/文字）"
+    size = _human(st.skipped_bytes)
+    if st.skipped_bytes < 10 * 1024:
+        return f"{st.skipped} 张图片已极小（共 {size}），无可压缩空间"
+    return f"{st.skipped} 张图片不可压缩（共 {size}）"
 
 
 # ---------------------------------------------------------------- 读文档
@@ -247,6 +262,32 @@ def _is_standard_cmyk_decode(obj) -> bool:
     return vals in ([1, 0, 1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 1, 0, 1])
 
 
+def _is_identity_decode(obj) -> bool:
+    """/Decode 是恒等映射吗？（[0 255] 对 8bit、[0 1] 对 1bit）
+
+    很多排版软件会把默认值显式写出来，例如 InDesign 导出的 Indexed 图
+    带 /Decode [0.0 255]。这不是自定义映射，值域和默认完全一致，
+    不能当跳过理由 —— 否则印刷稿里成片的小图标全被判"不可压缩"。
+    """
+    dec = obj.get("/Decode")
+    if dec is None:
+        return True
+    try:
+        vals = [float(_as_dict(x)) for x in dec]
+    except (TypeError, ValueError):
+        return False
+    if not vals:
+        return True
+    bpc = int(obj.get("/BitsPerComponent", 8) or 8)
+    hi = float((1 << bpc) - 1)
+    n = len(vals) // 2 if len(vals) >= 2 else 1
+    # 每个分量都是 [0, max] 对
+    for i in range(0, len(vals) - 1, 2):
+        if vals[i] != 0.0 or vals[i + 1] != hi:
+            return False
+    return len(vals) == 2 * n
+
+
 def _pixel_mode(obj) -> str:
     """FlateDecode 原始像素该用哪种 Pillow 模式装。"""
     if _is_cmyk(obj):
@@ -264,11 +305,14 @@ def _skip_reason(obj) -> str:
 
     注意：/SMask 不再当跳过理由。带蒙版的图只压颜色通道、蒙版原样保留，
     这样印刷设计稿里抠出来的人物图也能压。CMYK 同样支持。
+    /Decode 只有非恒等映射才跳（[0 255] 是默认值，InDesign 爱显式写出来）。
+    /Indexed 调色板图也放行 —— _reencode 会展开调色板，压不动再退回。
     """
     if obj.get("/ImageMask") in (True, "/True"):
         return "蒙版图"
     if obj.get("/Decode") is not None and not (
-        _is_cmyk(obj) and _is_standard_cmyk_decode(obj)
+        _is_identity_decode(obj)
+        or _is_standard_cmyk_decode(obj)
     ):
         return "自定义颜色映射"
     raw_cs = obj.get("/ColorSpace")
@@ -279,9 +323,56 @@ def _skip_reason(obj) -> str:
         return f"{cs} 色彩空间"
     if isinstance(cs, ArrayObject) and len(cs):
         head = _as_dict(cs[0])
-        if head in ("/Indexed", "/Separation"):
+        if head in ("/Separation", "/Pattern"):
             return f"{head} 色彩空间"
     return ""
+
+
+def _expand_indexed(obj, raw: bytes):
+    """/Indexed 调色板图：把索引像素按调色板展开成 CMYK/RGB/L。
+
+    InDesign 导出的印刷稿里小图标/渐变条常用这种（索引 + CMYK 调色板），
+    Flate 压完只有几百字节。展开后交 JPEG 重编码，压不动自然会被
+    "重编码反而更大"的检查挡回去，不会误伤。
+    """
+    cs = _as_dict(obj.get("/ColorSpace"))
+    if not (isinstance(cs, ArrayObject) and len(cs) >= 4):
+        return None
+    if _as_dict(cs[0]) != "/Indexed":
+        return None
+    w = int(obj.get("/Width", 0))
+    h = int(obj.get("/Height", 0))
+    bpc = int(obj.get("/BitsPerComponent", 8) or 8)
+    if bpc != 8 or w <= 0 or h <= 0 or len(raw) < w * h:
+        return None
+    base = _as_dict(cs[1])
+    hival = int(_as_dict(cs[2]))
+    lookup = cs[3]
+    if hasattr(lookup, "get_object"):
+        lookup = lookup.get_object()
+    if hasattr(lookup, "get_data"):
+        lut = lookup.get_data()
+    else:
+        lut = bytes(lookup) if lookup else b""
+    if base == "/DeviceCMYK":
+        mode, ch = "CMYK", 4
+    elif base == "/DeviceGray":
+        mode, ch = "L", 1
+    else:
+        mode, ch = "RGB", 3
+    need = (hival + 1) * ch
+    if len(lut) < need:
+        return None
+    pal = bytearray()
+    for idx in range(256):
+        entry = lut[idx * ch:(idx + 1) * ch] if idx <= hival else b""
+        pal.extend(entry or bytes(ch))
+    try:
+        im = Image.frombytes("P", (w, h), raw[: w * h])
+        im.putpalette(bytes(pal), mode)
+        return im.convert(mode)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _reencode(obj, quality: int) -> tuple[bytes, str] | None:
@@ -304,14 +395,21 @@ def _reencode(obj, quality: int) -> tuple[bytes, str] | None:
             bpc = int(obj.get("/BitsPerComponent", 8) or 8)
             if bpc != 8 or w <= 0 or h <= 0:
                 return None
-            mode = _pixel_mode(obj)
-            ch = {"L": 1, "RGB": 3, "CMYK": 4}[mode]
-            if len(raw) == w * h * ch:
-                im = Image.frombytes(mode, (w, h), raw)
+            # /Indexed 调色板图先展开成真彩色/灰度，再走统一重编码
+            cs = _as_dict(obj.get("/ColorSpace"))
+            if isinstance(cs, ArrayObject) and len(cs) and _as_dict(cs[0]) == "/Indexed":
+                im = _expand_indexed(obj, raw)
+                if im is None:
+                    return None
             else:
-                # 对不上就别硬塞，可能是 predictor 之类的边缘情况
-                im = Image.open(io.BytesIO(raw))
-                im.load()
+                mode = _pixel_mode(obj)
+                ch = {"L": 1, "RGB": 3, "CMYK": 4}[mode]
+                if len(raw) == w * h * ch:
+                    im = Image.frombytes(mode, (w, h), raw)
+                else:
+                    # 对不上就别硬塞，可能是 predictor 之类的边缘情况
+                    im = Image.open(io.BytesIO(raw))
+                    im.load()
         else:
             # JPX/CCITT/RunLength 等，保守放过
             return None
@@ -365,13 +463,19 @@ def _write_back(obj, data: bytes, mode: str) -> None:
         # PDF 里必须配这个 Decode 数组才不偏色（实测不写色差 6.2/255）。
         # 原本就是 DCTDecode 的图，Pillow 读进来已带 Adobe 语义，重存后
         # 直接就是对的，再补 Decode 反而偏色（实测 2.5/255）。
-        # 色彩空间一律保持原样，DeviceCMYK / ICCBased 4 分量都别改。
         if not was_jpeg:
             obj[NameObject("/Decode")] = ArrayObject(
                 [NumberObject(x) for x in (1, 0, 1, 0, 1, 0, 1, 0)]
             )
         elif "/Decode" in obj:
             del obj["/Decode"]
+        # 色彩空间：DeviceCMYK / ICCBased 4 分量保持原样；但 /Indexed 调色板
+        # 图展开重编码后数据已是真 CMYK，必须换掉，否则渲染器把像素当索引读
+        cs = _as_dict(obj.get("/ColorSpace"))
+        if _is_cmyk(obj):
+            pass
+        else:
+            obj[NameObject("/ColorSpace")] = NameObject("/DeviceCMYK")
         return
 
     # 非 CMYK 别留着反相数组，否则灰度/彩图会反过来
@@ -424,13 +528,12 @@ def scan_pdf(path: str | Path, pages: list[int] | None = None) -> dict[int, Page
             for _name, _ref, obj in _iter_images(reader.pages[i]):
                 if _skip_reason(obj):
                     stat.skipped += 1
+                    stat.skipped_bytes += _stream_len(obj)
                     continue
                 stat.count += 1
                 stat.cur_bytes += _stream_len(obj)
             if not stat.count:
-                stat.reason = (
-                    f"{stat.skipped} 张图片不可压缩" if stat.skipped else "本页无图片"
-                )
+                stat.reason = _no_compress_reason(stat)
             out[i] = stat
         return out
 
@@ -461,6 +564,7 @@ def estimate_pdf(
             for _name, _ref, obj in _iter_images(reader.pages[i]):
                 if _skip_reason(obj):
                     stat.skipped += 1
+                    stat.skipped_bytes += _stream_len(obj)
                     continue
                 cur = _stream_len(obj)
                 ident = getattr(obj, "indirect_reference", None)
@@ -474,6 +578,7 @@ def estimate_pdf(
                 res = _reencode(obj, quality)
                 if res is None:
                     stat.skipped += 1
+                    stat.skipped_bytes += cur
                     continue
                 stat.count += 1
                 stat.cur_bytes += cur
@@ -481,9 +586,7 @@ def estimate_pdf(
                 if num is not None:
                     seen[num] = (cur, len(res[0]))
             if not stat.count:
-                stat.reason = (
-                    f"{stat.skipped} 张图片不可压缩" if stat.skipped else "本页无图片"
-                )
+                stat.reason = _no_compress_reason(stat)
             out[i] = stat
             if progress is not None:
                 progress(int(step / max(1, len(idxs)) * 100))

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -349,17 +350,40 @@ def preview_compress_bytes(
     s: ImageSettings,
     info: ImageInfo | None = None,
 ) -> int:
-    """按图片工作台的方案真编一次到内存，返回字节数。
+    """按图片工作台的方案真编一次，返回字节数。
 
     给 PDF 队列拖质量条时做实时预估用。必须和 build_compress_steps
-    使用同一套格式 / 质量 / 长边，否则预估说 66kb、压出来 102kb，
-    用户会以为数字是编的。
+    走同一条 ffmpeg 命令 —— 以前这里拿 PIL 内存编码猜，同数值质量下
+    和 ffmpeg 差 1.5~3 倍（q78 估 941kb、压出来 300kb），预估数字对不上
+    实际，用户以为数字是编的。找不到 ffmpeg 时才退回 PIL，只当量级参考。
     """
+    info = info or probe_image(src)
+    ffmpeg = _find_tool("ffmpeg")
+    if ffmpeg:
+        try:
+            fmt = out_format(info, s)
+            with tempfile.TemporaryDirectory(prefix="zzbox_prev_") as td:
+                out = Path(td) / f"p.{fmt}"
+                cmds, made, err = build_compress_steps(
+                    ffmpeg, Path(src), s, info, out_path=out
+                )
+                if err:
+                    raise RuntimeError(err)
+                for cmd in cmds:
+                    r = subprocess.run(
+                        cmd, capture_output=True, creationflags=CREATE_NO_WINDOW
+                    )
+                    if r.returncode != 0:
+                        raise RuntimeError(
+                            (r.stderr or b"").decode("utf-8", "replace")[:200]
+                        )
+                return made.stat().st_size
+        except Exception:  # noqa: BLE001
+            pass  # 退回下面的 PIL 估算
     import io
 
     from PIL import Image
 
-    info = info or probe_image(src)
     fmt = out_format(info, s)
     w, h = target_size(info, s, 1)
     with Image.open(src) as im:
@@ -427,11 +451,13 @@ def build_ai_steps(
     info: ImageInfo,
     tmp_png: Path,
     tile: int = 128,
+    out_path: Path | None = None,
 ) -> tuple[list[list[str]], Path, str]:
     """AI 超分：引擎出 4× PNG，再交给 ffmpeg 缩放 / 锐化 / 编码。
 
     中间文件刻意用 PNG —— 引擎只会写 PNG/JPG/WEBP，而 JPG 会在这一步就把
     重建出来的细节再压掉一次，后面降采样时就看不出超分的收益了。
+    out_path 给了就写到那里（合成 PDF 时中间件要落临时目录）。
     """
     name = MODELS.get(s.model, MODELS[DEFAULT_MODEL])[0]
     k = infer_scale(s)          # 引擎实际跑的倍率
@@ -463,7 +489,9 @@ def build_ai_steps(
         vf.append("format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a=255")
     filt = ",".join(vf) if vf else "null"
 
-    out = make_output_path(src, s, info, (w, h), ai=True)
+    out = Path(out_path) if out_path is not None else make_output_path(
+        src, s, info, (w, h), ai=True
+    )
     step2 = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
         "-i", str(tmp_png), "-frames:v", "1", "-vf", filt,
@@ -472,6 +500,56 @@ def build_ai_steps(
         str(out),
     ]  # fmt: skip
     return [step1, step2], out, ""
+
+
+def merge_images_to_pdf(
+    images: list[Path],
+    out: Path,
+    quality: int = 85,
+) -> Path:
+    """把一堆图片装订成一个 PDF，一页一图。
+
+    透明图先摊到白底上 —— PDF 的页面没有透明通道，不摊开会变成黑底。
+    嵌入流按 JPEG 质量压缩（quality），纯黑白图走无损 Flate。
+    """
+    from PIL import Image
+
+    if not images:
+        raise ValueError("没有可装订的图片")
+
+    pages = []
+    opened = []
+    try:
+        for p in images:
+            im = Image.open(p)
+            opened.append(im)
+            if im.mode in ("RGBA", "LA", "PA") or (
+                im.mode == "P" and "transparency" in im.info
+            ):
+                rgba = im.convert("RGBA")
+                base = Image.new("RGB", rgba.size, (255, 255, 255))
+                base.paste(rgba, mask=rgba.getchannel("A"))
+                pages.append(base)
+            elif im.mode != "RGB":
+                pages.append(im.convert("RGB"))
+            else:
+                pages.append(im)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pages[0].save(
+            out,
+            "PDF",
+            save_all=True,
+            append_images=pages[1:],
+            quality=max(1, min(100, quality)),
+            resolution=150.0,
+        )
+    finally:
+        for im in opened:
+            try:
+                im.close()
+            except Exception:
+                pass
+    return out
 
 
 # ---------------------------------------------------------------- 估算

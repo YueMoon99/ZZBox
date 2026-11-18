@@ -80,7 +80,7 @@ def main() -> int:
 
     win._pdf_begin_compress([t_uid])
     pump(app, 40)
-    check("副标题给出原因", sub_of(win, t_uid) == "本页无图片", sub_of(win, t_uid))
+    check("副标题给出原因", sub_of(win, t_uid) == "本页无位图（矢量/文字）", sub_of(win, t_uid))
     check("不再写估算中", "估算中" not in sub_of(win, t_uid))
     check(
         "提示行说明保持原样",
