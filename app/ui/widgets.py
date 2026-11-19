@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import i18n
 from app.ui import style
 
 # 状态 -> (圆点颜色, 默认文字)
@@ -119,6 +120,8 @@ class ChipGroup(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
+        # 记住模式：切语言后要按新文字重算宽度（英文一般比中文长）
+        self._fill = fill
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
         self._buttons: dict[str, QPushButton] = {}
@@ -197,6 +200,22 @@ class ChipGroup(QWidget):
                         self.set_value(k, emit=True)
                         break
 
+    def retranslate_ui(self) -> None:
+        """切语言后按新文字重算宽度，否则英文会被 72px 的死宽度裁掉。"""
+        if not self._buttons:
+            return
+        # 先把死宽度放开，sizeHint 才会按新文字重新量一遍；直接读 sizeHint
+        # 拿到的还是旧宽度，越切越窄。
+        for b in self._buttons.values():
+            b.setMinimumWidth(0)
+            b.setMaximumWidth(16777215)
+        w = max(72, max(b.sizeHint().width() for b in self._buttons.values()))
+        for b in self._buttons.values():
+            if self._fill:
+                b.setMinimumWidth(w)
+            else:
+                b.setFixedWidth(w)
+
 
 class _TabStrip(QWidget):
     """页签条：一组扁平页签按钮。
@@ -230,7 +249,7 @@ class _TabStrip(QWidget):
             btn.setToolTip(tip)
         # 用 0 宽度占位，真实宽度交给字体度量，避免中英文混排时页签忽宽忽窄
         fm = btn.fontMetrics()
-        btn.setFixedWidth(fm.horizontalAdvance(text) + 36)
+        btn.setFixedWidth(fm.horizontalAdvance(btn.text()) + 36)
         self._lay.addWidget(btn)
         self._buttons.append(btn)
         return btn
@@ -241,6 +260,11 @@ class _TabStrip(QWidget):
     def set_active(self, index: int) -> None:
         self._active = index
         self.update()
+
+    def retranslate_ui(self) -> None:
+        """页签宽度是按创建时那段文字量出来的，换语言必须重量一次。"""
+        for btn in self._buttons:
+            btn.setFixedWidth(btn.fontMetrics().horizontalAdvance(btn.text()) + 36)
 
 
 class PropertyTabs(QWidget):
@@ -337,7 +361,9 @@ class HintLine(QLabel):
 
     # ------------------------------------------------------------------
     def setText(self, text: str) -> None:  # noqa: N802
-        self._full = text or ""
+        # 这一行是自己画的（paintEvent 用 _full），所以得先翻好再存；
+        # 交给 setText 补丁只能在 QLabel 内部翻，画出来还是原文
+        self._full = i18n.tr(text or "")
         self._offset = 0
         super().setText(self._full)
         self._sync_timer()
@@ -418,6 +444,7 @@ class OptionPanel(QFrame):
         self._row = 0
         self._col = 0
         self._cells: list[QWidget] = []
+        self._tags: list[tuple[QLabel, int]] = []
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 10, 12, 10)
@@ -455,6 +482,8 @@ class OptionPanel(QFrame):
         tag = QLabel(label)
         tag.setObjectName("optlabel")
         tag.setFixedWidth(tag_w)
+        # 记下原始宽度：英文比中文长，切语言时要按字体重新量
+        self._tags.append((tag, tag_w))
         lay.addWidget(tag)
         lay.addWidget(widget, 1)
 
@@ -480,6 +509,12 @@ class OptionPanel(QFrame):
     def set_alert(self, text: str) -> None:
         """设置黄色警示行；传空串只清文字 —— 行本身常驻，高度不变。"""
         self.alert.setText(text)
+
+    def retranslate_ui(self) -> None:
+        """标签列是按中文宽度定死的，换成英文会截字，按新文字重量一次。"""
+        for tag, base in self._tags:
+            need = tag.fontMetrics().horizontalAdvance(tag.text()) + 2
+            tag.setFixedWidth(max(base, need))
 
     def pin_height(self) -> None:
         """把面板总高钉死在当前 sizeHint 上。
@@ -594,7 +629,9 @@ class RowActions(QWidget):
             self.status.setVisible(True)
             self.status.setGeometry(text_x, 0, avail, h)
             self.status.setText(
-                self.status.fontMetrics().elidedText(self._text, Qt.ElideRight, avail)
+                self.status.fontMetrics().elidedText(
+                    i18n.tr(self._text), Qt.ElideRight, avail
+                )
             )
         else:
             self.status.setVisible(False)
@@ -645,6 +682,10 @@ class RowActions(QWidget):
     def status_text(self) -> str:
         """完整状态文字（不受列宽省略影响），测试与提示用。"""
         return self._text
+
+    def retranslate_ui(self) -> None:
+        # 状态是 elided 过的，换语言得按新文字重新省略一次
+        self._place()
 
 
 @dataclass

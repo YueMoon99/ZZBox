@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import i18n
 from app.core.ai import (
     DEFAULT_MODEL,
     MODELS,
@@ -513,6 +514,17 @@ class MainWindow(QMainWindow):
         lay.addSpacing(8)
         lay.addWidget(self.mode_hint)
         lay.addStretch(1)
+
+        # 语言切换放在这一条的右端：它属于「整个工作台」，不属于某个队列
+        # 按钮文字要写「对方」的语言（中文态写英文），所以绕开翻译直接写：
+        # 走 setText 补丁的话，「Switch to English」会被反向词表再翻回中文。
+        self.btn_lang = QPushButton()
+        self.btn_lang.setObjectName("link")
+        self.btn_lang.setCursor(Qt.PointingHandCursor)
+        i18n.literal(self.btn_lang, i18n.switch_label())
+        i18n.literal(self.btn_lang, i18n.switch_tip(), "setToolTip")
+        self.btn_lang.clicked.connect(self._switch_language)
+        lay.addWidget(self.btn_lang)
         return bar
 
     _MODE_HINTS = (
@@ -534,6 +546,28 @@ class MainWindow(QMainWindow):
         self._update_start_text()
         self._refresh_count()
         if mode == 2:
+            self._pdf_refresh()
+        self._sync_tray()
+
+    # ------------------------------------------------------------ 语言
+    def _switch_language(self) -> None:
+        """中英互切。翻译、重扫、存盘都在 i18n 里，这里只负责把消息发出去。"""
+        i18n.set_language(i18n.EN if i18n.LANG == i18n.ZH else i18n.ZH)
+
+    def retranslate_ui(self) -> None:
+        """i18n 重扫完控件后回调：把「随状态现算」的文案重新生成一遍。
+
+        纯静态文字已经被重扫覆盖了，但「开始压制」「文件队列 · 3 个」这类
+        是根据当前状态拼出来的，重扫只能翻到旧句子，得重新算一次。
+        """
+        i18n.literal(self.btn_lang, i18n.switch_label())
+        i18n.literal(self.btn_lang, i18n.switch_tip(), "setToolTip")
+        self.setWindowTitle(f"{APP_TITLE} {APP_VERSION}")
+        self.mode_hint.setText(self._MODE_HINTS[self._page] if self._page < 3 else "")
+        self._update_start_text()
+        self._refresh_count()
+        self._img_refresh_count()
+        if not self.pdf_runner.busy():
             self._pdf_refresh()
         self._sync_tray()
 
@@ -2011,7 +2045,7 @@ class MainWindow(QMainWindow):
             self.enc_chips.button(key).setToolTip(tip)
 
         self.audio_chips = ChipGroup(
-            [("aac", "压缩 AAC"), ("copy", "保留原样"), ("none", "删除")]
+            [("aac", "压缩 AAC"), ("copy", "保留原样"), ("none", "移除")]
         )
         self.audio_chips.set_value("aac")
         self.audio_chips.changed.connect(lambda _k: self._refresh_rows())

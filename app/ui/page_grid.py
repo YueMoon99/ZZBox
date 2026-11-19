@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
 )
 
+from app import i18n
 from app.ui import style
 
 UID_ROLE = Qt.UserRole + 1
@@ -117,6 +118,7 @@ class _PageDelegate(QStyledItemDelegate):
         # ---- 右上角小角标（「已压缩」绿 / 「不可压缩」黄）：贴着缩略图右上，压在图上
         badge = index.data(BADGE_ROLE) or ""
         if badge and icon_target is not None:
+            badge = i18n.tr(str(badge))
             tone = index.data(BADGE_TONE_ROLE) or "ok"
             bf = QFont(option.font)
             bf.setPixelSize(9)
@@ -160,7 +162,7 @@ class _PageDelegate(QStyledItemDelegate):
         painter.drawText(
             QRect(rect.left() + 3, y, inner_w, line1),
             Qt.AlignHCenter | Qt.AlignVCenter,
-            fm.elidedText(str(title), Qt.ElideMiddle, inner_w),
+            fm.elidedText(i18n.tr(str(title)), Qt.ElideMiddle, inner_w),
         )
         if sub:
             painter.setFont(f2)
@@ -176,7 +178,7 @@ class _PageDelegate(QStyledItemDelegate):
             painter.drawText(
                 QRect(rect.left() + 3, y + line1, inner_w, line2),
                 Qt.AlignHCenter | Qt.AlignVCenter,
-                fm2.elidedText(str(sub), Qt.ElideRight, inner_w),
+                fm2.elidedText(i18n.tr(str(sub)), Qt.ElideRight, inner_w),
             )
         painter.restore()
 
@@ -628,7 +630,7 @@ class PageGrid(QListWidget):
         p.drawText(
             self.viewport().rect(),
             Qt.AlignCenter | Qt.TextWordWrap,
-            self._empty_text,
+            i18n.tr(self._empty_text),
         )
         p.end()
 
