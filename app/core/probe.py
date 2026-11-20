@@ -38,6 +38,12 @@ class Encoder:
     label: str
     available: bool = False
     reason: str = ""
+    # 硬件能力：只决定命令里能写哪些参数，不影响「可用 / 不可用」的判定
+    bit10: bool = True    # 能直接编 10bit 输入（H.264 要 Blackwell）
+    bframes: bool = True  # 支持 B 帧参考（要 Turing 起）
+    # 完整参数集（p6 预设 + 空间 AQ + lookahead + multipass）能不能跑。
+    # 老驱动/老卡上偶有单项不支持，整组降级成最小参数也比压不出来强。
+    advanced: bool = True
 
 
 @dataclass
@@ -48,6 +54,7 @@ class EnvInfo:
     gpu_name: str = ""
     driver: str = ""
     vram_mb: int = 0
+    tonemap: bool = True  # ffmpeg 带 zscale，能把 HDR 转 SDR
     encoders: list[Encoder] = field(default_factory=list)
     error: str = ""
 
@@ -133,6 +140,41 @@ def _smoke_test(ffmpeg: str, enc: str) -> tuple[bool, str]:
     return False, msg[-1][:120] if msg else "未知错误"
 
 
+def _caps_test(ffmpeg: str, enc: str, extra: list[str]) -> bool:
+    """在 0.2 秒空帧上验证某一项硬件特性到底能不能用。
+
+    参数刻意保持最小集：这里测的是硬件能力，不是预设。把 -preset p6 之类也塞
+    进来，老卡会因为别的原因失败，反而把「不支持 B 帧」误判成「编码器不可用」。
+    """
+    r = _run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=640x360:r=25:d=0.2",
+            "-c:v",
+            enc,
+            *extra,
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout=25,
+    )
+    return bool(r is not None and r.returncode == 0)
+
+
+def _has_filter(ffmpeg: str, name: str) -> bool:
+    r = _run([ffmpeg, "-hide_banner", "-filters"], timeout=15)
+    if r is None or r.returncode != 0:
+        return False
+    return re.search(rf"\b{re.escape(name)}\b", r.stdout or "") is not None
+
+
 def probe_environment() -> EnvInfo:
     info = EnvInfo()
     info.ffmpeg = _find_tool("ffmpeg")
@@ -149,9 +191,28 @@ def probe_environment() -> EnvInfo:
         ("hevc", "hevc_nvenc", "HEVC"),
         ("av1", "av1_nvenc", "AV1"),
     ]
+    # 先按「完整参数集」试一遍：过了就说明编码器可用，且 p6 / 空间 AQ /
+    # multipass 这些都能吃，省掉一次单独的冒烟测试（每次都要拉起一个 ffmpeg）。
+    advanced_args = [
+        "-preset", "p6", "-tune", "hq",
+        "-spatial-aq", "1", "-aq-strength", "8",
+        "-rc-lookahead", "20", "-multipass", "qres",
+    ]  # fmt: skip
     for key, enc, label in candidates:
         item = Encoder(key=key, name=enc, label=label)
-        ok, reason = _smoke_test(info.ffmpeg, enc)
-        item.available, item.reason = ok, reason
+        item.advanced = _caps_test(info.ffmpeg, enc, advanced_args)
+        if item.advanced:
+            item.available = True
+        else:
+            # 完整参数没过：可能是老卡不吃某一项，也可能编码器根本不可用
+            item.available, item.reason = _smoke_test(info.ffmpeg, enc)
+        if item.available:
+            # 10bit：H.264 要 Blackwell 才有 High10；HEVC 要 Pascal 起；
+            # AV1 编码器整代都是 10bit。统一探一遍，别按型号猜。
+            item.bit10 = _caps_test(info.ffmpeg, enc, ["-pix_fmt", "p010le"])
+            # B 帧参考：Turing 之前没有。不探就只能等用户压到一半去撞墙
+            if key in ("h264", "hevc"):
+                item.bframes = _caps_test(info.ffmpeg, enc, ["-b_ref_mode", "middle"])
         info.encoders.append(item)
+    info.tonemap = _has_filter(info.ffmpeg, "zscale")
     return info

@@ -119,10 +119,29 @@ class EncodeRunner(QObject):
             return "磁盘空间不足"
         if "invalid data found" in low or "moov atom not found" in low:
             return "文件已损坏或格式不支持"
+        # 源素材的解码器这个 ffmpeg 构建里没有（老式 RMVB / VC-1 之类）
+        if "decoder (codec" in low and "not found" in low:
+            return "当前的 ffmpeg 无法解码这种素材（缺少解码器）"
+        if "error while decoding" in low or "invalid nal unit" in low:
+            return "素材解码出错，文件可能已损坏"
         if "permission denied" in low:
             return "没有写入权限，请换一个输出目录"
         if "unknown encoder" in low:
             return "当前 ffmpeg 不支持该编码器"
+        # NVENC 的「能力不足」在 stderr 里只有这一句，直接抛给用户等于什么都没说
+        if "no capable devices found" in low:
+            return "显卡不支持这组编码参数（10bit、B 帧或分辨率超限），请换 HEVC 或降低分辨率"
+        if "b frames as references are not supported" in low:
+            return "该显卡不支持 B 帧参考（Pascal 及更早的 NVENC）"
+        if "nothing was written into output file" in low:
+            return "编码器没有产出画面，显卡可能不支持该格式或分辨率"
+        # 4:2:2 / 4:4:4 或者缺色彩标签的素材，zscale 会以这句失败
+        if "no path between colorspaces" in low:
+            return "色彩格式无法转换（源素材的色度抽样或色彩标签异常）"
+        if "less than the minimum supported value" in low:
+            return "分辨率低于显卡编码器的最小要求"
+        if "could not open encoder before eof" in low:
+            return "编码器初始化失败，显卡可能不支持这组参数"
         if "out of memory" in low:
             return "显存或内存不足"
         if "already exists" in low:

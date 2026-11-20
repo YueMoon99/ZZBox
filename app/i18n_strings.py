@@ -251,6 +251,9 @@ STRINGS: dict[str, str] = {
     "先把图片拖进来，或点右上角“+”添加图片。":
         "Drag images in first, or click + at the top right.",
     "没有可压制的文件": "Nothing to encode",
+    "正在检测显卡": "Checking the GPU",
+    "还在确认显卡和 ffmpeg，稍等一两秒再开始。":
+        "Still probing the GPU and ffmpeg — give it a second, then start again.",
     "所有项目都已完成或被锁定。\n": "Every item is done or locked.\n",
     "全部完成": "All done",
     "存在失败任务": "Some tasks failed",
@@ -557,9 +560,44 @@ STRINGS: dict[str, str] = {
     "无法启动 ffmpeg，请确认 bin 目录中的 ffmpeg.exe 存在":
         "Can't start ffmpeg; check that bin/ffmpeg.exe exists",
     "文件已损坏或格式不支持": "The file is damaged or the format is unsupported",
+    "当前的 ffmpeg 无法解码这种素材（缺少解码器）":
+        "This ffmpeg build can't decode that source (decoder missing)",
+    "素材解码出错，文件可能已损坏": "Decoding failed; the file may be damaged",
     "没有写入权限，请换一个输出目录":
         "No write permission; choose another output folder",
     "当前 ffmpeg 不支持该编码器": "This ffmpeg build doesn't support that encoder",
+    "显卡不支持这组编码参数（10bit 或 B 帧），请换 HEVC 或升级显卡":
+        "The GPU rejects these encoder settings (10-bit or B-frames); "
+        "use HEVC or a newer card",
+    "显卡不支持这组编码参数（10bit、B 帧或分辨率超限），请换 HEVC 或降低分辨率":
+        "The GPU rejects these encoder settings (10-bit, B-frames or resolution); "
+        "switch to HEVC or lower the resolution",
+    "该显卡不支持 B 帧参考（Pascal 及更早的 NVENC）":
+        "This GPU has no B-frames-as-references (Pascal and older NVENC)",
+    "编码器没有产出画面，显卡可能不支持该格式":
+        "The encoder produced no frames; the GPU may not support this format",
+    "编码器没有产出画面，显卡可能不支持该格式或分辨率":
+        "The encoder produced no frames; the GPU may not support this format or resolution",
+    "色彩格式无法转换（源素材的色度抽样或色彩标签异常）":
+        "Colour conversion failed (odd chroma subsampling or colour tags in the source)",
+    "分辨率低于显卡编码器的最小要求":
+        "Resolution is below the GPU encoder's minimum",
+    "编码器初始化失败，显卡可能不支持这组参数":
+        "Encoder init failed; the GPU may not accept these settings",
+    "{}×{} 超出 {} 的上限 {}px，已按 {}×{} 输出":
+        "{}×{} exceeds the {} limit of {}px; outputting {}×{}",
+    "目标 {}×{} 小于显卡最小尺寸 {}×{}，已按原尺寸输出":
+        "Target {}×{} is below the GPU minimum {}×{}; keeping the original size",
+    "分辨率 {}×{} 低于显卡最小尺寸，已放大到 {}×{} 后编码":
+        "{}×{} is below the GPU minimum; upscaled to {}×{} before encoding",
+    "{} 不支持 10bit，HDR 素材已转为 SDR":
+        "{} can't encode 10-bit; HDR tone-mapped to SDR",
+    "{} 不支持 10bit，已降为 8bit（HDR 信息丢失）":
+        "{} can't encode 10-bit; dropped to 8-bit (HDR lost)",
+    "{} 不支持 10bit，已降为 8bit":
+        "{} can't encode 10-bit; dropped to 8-bit",
+    "压缩 · 转码 · AI 超分补帧 · 音轨处理 · HDR 素材将转为 SDR":
+        "Compress · transcode · AI upscale & interpolate · audio · HDR → SDR",
     "显存或内存不足": "Out of VRAM or memory",
     "输出文件已存在": "The output file already exists",
     "ffmpeg 退出码 {}": "ffmpeg exit code {}",

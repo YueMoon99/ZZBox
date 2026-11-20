@@ -59,6 +59,55 @@ class EncodeSettings:
 
 
 @dataclass
+class EncCaps:
+    """当前显卡/ffmpeg 的真实能力。探测结果由 probe.py 填，测试可手工构造。
+
+    这几项共同决定命令能不能跑起来 —— 任何一项写死，老卡上都会当场初始化失败。
+    """
+
+    bit10: bool = True      # 编码器能直接吃 10bit 输入
+    bframes: bool = True    # 支持 B 帧参考（-b_ref_mode middle，Turing 起）
+    tonemap: bool = True    # ffmpeg 带 zscale，能把 HDR 转成 SDR
+    advanced: bool = True   # p6 预设 + 空间 AQ + lookahead + multipass 这组能跑
+
+
+# HDR10 / HLG → BT.709 SDR。H.264 没有 10bit（Blackwell 之前），要它出片只能先转 SDR。
+# npl=100 是 100 nit 的参考白，hable 曲线对高光的压缩比 reinhard 自然。
+# 头部显式写死输入的矩阵/原色/传输：工程素材经常整片不带色彩标签，缺标签时
+# zscale 会直接报 "no path between colorspaces" 并让整条命令失败。
+TONEMAP_TAIL = (
+    "format=gbrpf32le,zscale=t=linear:npl=100,zscale=p=bt709,"
+    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+)
+TONEMAP_CHAIN = "zscale=t=linear:npl=100," + TONEMAP_TAIL
+
+# NVENC 的硬尺寸边界（NVIDIA 官方能力表）：
+#   H.264 每边上限 4096 —— 5K/8K/全景素材选 H.264 会直接初始化失败，
+#           报的却是 "Nothing was written into output file"，用户根本看不出原因。
+#   HEVC / AV1 每边上限 8192。
+#   最小边约 144×48，低于它 NVENC 拒绝初始化（缩放到 25% 的小素材会撞上）。
+ENC_MAX_DIM = {"h264": 4096, "hevc": 8192, "av1": 8192}
+ENC_MIN_W = 144
+ENC_MIN_H = 48
+ENC_LABEL = {"h264": "H.264", "hevc": "HEVC", "av1": "AV1"}
+
+
+def tonemap_chain(media: MediaInfo) -> str:
+    """按素材自己的色彩标签拼色调映射链，标签缺失时按 HDR10 的常规值兜底。"""
+    matrix = media.color_space or "bt2020nc"
+    prim = media.color_primaries or "bt2020"
+    trc = media.color_transfer or "smpte2084"
+    known = {"bt2020nc", "bt709", "smpte170m", "bt470bg"}
+    if matrix not in known:
+        matrix = "bt2020nc"
+    if prim not in {"bt2020", "bt709", "smpte170m"}:
+        prim = "bt2020"
+    if trc not in {"smpte2084", "arib-std-b67"}:
+        trc = "smpte2084"
+    return f"zscale=m={matrix}:p={prim}:t={trc}:r=tv," + TONEMAP_TAIL
+
+
+@dataclass
 class BuildResult:
     cmd: list[str] = field(default_factory=list)
     output: str = ""
@@ -72,8 +121,13 @@ def _even(v: float) -> int:
     return max(2, n)
 
 
-def compute_target(media: MediaInfo, s: EncodeSettings) -> tuple[int, int]:
-    sw, sh = media.width, media.height
+def _raw_target(media: MediaInfo, s: EncodeSettings) -> tuple[int, int]:
+    """按用户选的缩放算出目标尺寸。
+
+    注意用的是「显示尺寸」而不是存储尺寸：手机竖拍是横着存的加一个旋转标记，
+    ffmpeg 一上滤镜就先转正，再按存储宽高去 scale 会把画面压扁。
+    """
+    sw, sh = media.display_width, media.display_height
     if not sw or not sh:
         return 0, 0
 
@@ -90,6 +144,46 @@ def compute_target(media: MediaInfo, s: EncodeSettings) -> tuple[int, int]:
     if h > 0:
         return _even(h * sw / sh), _even(h)
     return sw - sw % 2, sh - sh % 2
+
+
+def target_plan(media: MediaInfo, s: EncodeSettings) -> tuple[int, int, str]:
+    """目标尺寸 + 一句「为什么和你想的不一样」。
+
+    两条硬边界在这里兜住，不让它们变成一条看不懂的 ffmpeg 报错：
+      超过编码器上限 → 等比缩到上限（8K 选 H.264 只能到 4096，这是必然的）；
+      低于 NVENC 下限 → 放弃缩放、按原尺寸出（否则初始化直接失败）。
+    """
+    w, h = _raw_target(media, s)
+    if not w or not h:
+        return 0, 0, ""
+
+    cap = ENC_MAX_DIM.get(s.encoder, 8192)
+    if w > cap or h > cap:
+        f = min(cap / w, cap / h)
+        nw, nh = _even(w * f), _even(h * f)
+        note = (
+            f"{w}×{h} 超出 {ENC_LABEL.get(s.encoder, s.encoder.upper())} 的上限 {cap}px，"
+            f"已按 {nw}×{nh} 输出"
+        )
+        return nw, nh, note
+
+    if w < ENC_MIN_W or h < ENC_MIN_H:
+        sw, sh = media.display_width, media.display_height
+        if sw >= ENC_MIN_W and sh >= ENC_MIN_H:
+            note = f"目标 {w}×{h} 小于显卡最小尺寸 {ENC_MIN_W}×{ENC_MIN_H}，已按原尺寸输出"
+            return sw - sw % 2, sh - sh % 2, note
+        # 素材本身就比下限还小，只能往上放大 —— 否则 NVENC 连初始化都不做
+        f = max(ENC_MIN_W / max(sw, 1), ENC_MIN_H / max(sh, 1))
+        nw, nh = _even(sw * f), _even(sh * f)
+        note = f"分辨率 {sw}×{sh} 低于显卡最小尺寸，已放大到 {nw}×{nh} 后编码"
+        return nw, nh, note
+
+    return w, h, ""
+
+
+def compute_target(media: MediaInfo, s: EncodeSettings) -> tuple[int, int]:
+    w, h, _ = target_plan(media, s)
+    return w, h
 
 
 def make_output_path(src: Path, s: EncodeSettings, enc: str) -> Path:
@@ -157,32 +251,90 @@ def estimate_output_bytes(media: MediaInfo, s: EncodeSettings) -> int:
 
 
 def build_command(
-    media: MediaInfo, s: EncodeSettings, ffmpeg: str, output: Path | None = None
+    media: MediaInfo,
+    s: EncodeSettings,
+    ffmpeg: str,
+    output: Path | None = None,
+    caps: EncCaps | None = None,
 ) -> BuildResult:
     warnings: list[str] = []
+    caps = caps or EncCaps()
     src = Path(media.path)
     enc = ENC_NAME.get(s.encoder, "hevc_nvenc")
     out = output or make_output_path(src, s, s.encoder)
-    tw, th = compute_target(media, s)
+    tw, th, size_note = target_plan(media, s)
+    if size_note:
+        warnings.append(size_note)
 
     cmd: list[str] = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin"]
     cmd += ["-i", str(src)]
 
-    cmd += ["-map", "0:v:0", "-map_metadata", "0"]
+    cmd += ["-map", "0:V:0", "-map_metadata", "0"]
 
-    # ---- 缩放 ----
-    need_scale = tw and th and (tw != media.width or th != media.height)
+    # ---- 缩放 / HDR 处理 ----
+    # 跟「显示尺寸」比：竖拍视频的存储宽高是横的，转正之后才对得上。
+    dw, dh = media.display_width, media.display_height
+    need_scale = tw and th and (tw != dw or th != dh)
+    filters: list[str] = []
     if need_scale:
-        cmd += ["-vf", f"scale={tw}:{th}:flags=lanczos"]
+        filters.append(f"scale={tw}:{th}:flags=lanczos")
+
+    # NVENC 的 10bit 支持按代际分：H.264 要 Blackwell（RTX 50 系），HEVC 要 Pascal 起，
+    # Maxwell 的 HEVC 只有 8bit。直接喂 10bit 会报 "No capable devices found" 并立刻退出
+    # —— 这就是「选了编码器就失败」最常见的那个原因。
+    # 处理办法：能色调映射就映射成 SDR（画面正确），映射不了至少把标签改对，
+    # 免得播放器拿 PQ 曲线去解释 8bit 数据，整片发灰。
+    label = ENC_LABEL.get(s.encoder, s.encoder.upper())
+    deep = media.bit_depth > 8
+    needs_down = not caps.bit10 and deep
+    # 只有真的是 HDR 才做色调映射。10bit ≠ HDR —— ProRes / DNxHR 这类 10bit SDR
+    # 工程素材一旦被塞进 tonemap 链，zscale 会因为缺色彩标签报
+    # "no path between colorspaces"，整条命令当场失败。
+    tonemap = needs_down and caps.tonemap and media.is_hdr
+    if tonemap:
+        filters.append(tonemap_chain(media))
+
+    if filters:
+        cmd += ["-vf", ",".join(filters)]
 
     # ---- 视频编码 ----
-    cmd += ["-c:v", enc, "-preset", "p6", "-tune", "hq"]
+    # 老卡 / 老驱动上 p6 + 空间 AQ + multipass 这一组可能有一项不吃，
+    # 探测没过就退回最朴素的参数：画质略差，但一定出得来片。
+    if caps.advanced:
+        cmd += ["-c:v", enc, "-preset", "p6", "-tune", "hq"]
+    else:
+        cmd += ["-c:v", enc]
 
-    if media.is_rgb:
-        # 源本身是 RGB 编码（gbrp / rgb24）时，不指定就会原样继承：NVENC 会编出
-        # HEVC Rext + gbrp，绝大多数播放器按 YUV 解释，画面直接绿配品红。
-        # 只在源为 RGB 时兜底，避免改变 10bit 素材现有的位深行为。
-        cmd += ["-pix_fmt", "yuv420p"]
+    # 像素格式不能交给它自己挑：
+    #   4:2:2 / 4:4:4（ProRes、DNxHR…）原样交出去，NVENC 会编成 HEVC Rext，
+    #   显卡硬解、手机、Safari 全都解不了 —— 文件能出，但等于废片。
+    #   RGB 源会编成 gbrp，播放器按 YUV 解就是绿配品红。
+    # 统一降到 4:2:0，位深能留就留（10bit 走 yuv420p10le，HDR 才保得住）。
+    pix = ""
+    if needs_down:
+        pix = "yuv420p"
+    elif not media.is_420:
+        pix = "yuv420p10le" if (deep and caps.bit10) else "yuv420p"
+    if pix:
+        cmd += ["-pix_fmt", pix]
+
+    if needs_down and media.is_hdr:
+        # 降位深之后画面已经是 SDR 了，标签必须跟着改，否则 HDR 播放器会二次映射。
+        # 10bit 但不是 HDR 的素材不改标签 —— 它本来就没走 PQ 曲线。
+        cmd += [
+            "-color_range", "tv",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+        ]  # fmt: skip
+        warnings.append(
+            f"{label} 不支持 10bit，HDR 素材已转为 SDR"
+            if tonemap
+            else f"{label} 不支持 10bit，已降为 8bit（HDR 信息丢失）"
+        )
+    elif needs_down:
+        # 10bit 但不带 HDR（ProRes / DNxHR 这类工程素材）：只是降位深，别吓人
+        warnings.append(f"{label} 不支持 10bit，已降为 8bit")
 
     if s.mode == "bitrate":
         kbps = max(100, int(s.bitrate_kbps))
@@ -201,13 +353,17 @@ def build_command(
         cmd += ["-rc", "vbr", "-cq", str(s.crf_to_cq()), "-b:v", "0"]
 
     if s.encoder in ("h264", "hevc"):
-        cmd += [
-            "-spatial-aq", "1",
-            "-aq-strength", "8",
-            "-rc-lookahead", "20",
-            "-multipass", "qres",
-            "-b_ref_mode", "middle",
-        ]  # fmt: skip
+        if caps.advanced:
+            cmd += [
+                "-spatial-aq", "1",
+                "-aq-strength", "8",
+                "-rc-lookahead", "20",
+                "-multipass", "qres",
+            ]  # fmt: skip
+        # B 帧参考要 Turing 起才有（Pascal / Maxwell / Volta 的 HEVC 连 B 帧都不支持）。
+        # 老卡上必须显式写 0：FFmpeg 默认是 -1（自动），gyan.dev 这类构建会自己开
+        # middle，NVENC 初始化直接返回「设备不支持」—— 表现就是 HEVC 也压不了。
+        cmd += ["-b_ref_mode", "middle" if caps.bframes else "0"]
 
     if s.encoder == "hevc" and s.container in ("mp4", "mov"):
         cmd += ["-tag:v", "hvc1"]  # 不加这行 iOS/Safari 播不了
@@ -220,6 +376,11 @@ def build_command(
     else:
         cmd += ["-map", "0:a?"]
         if audio_mode == "aac":
+            # 声道布局是 unknown 的素材（PCM 工程文件、部分 MKV）在 AAC 里会变成
+            # "6 channels" 这种没有名字的布局，编码器直接报错，
+            # 连带整个文件压不出来。aformat 只是把布局名补正，声道数不变。
+            if any(a.layout_unknown for a in media.audio):
+                cmd += ["-af", "aformat=channel_layouts=mono|stereo|5.1|7.1"]
             cmd += ["-c:a", "aac", "-b:a", f"{AUDIO_TARGET_KBPS}k"]
         else:
             cmd += ["-c:a", "copy"]
@@ -259,7 +420,7 @@ def build_strip_audio_cmd(
     cmd: list[str] = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin"]
     cmd += ["-i", str(src)]
     # 只取主视频流做 copy，音轨/字幕/数据流一律不带过去
-    cmd += ["-map", "0:v:0", "-c:v", "copy", "-map_metadata", "0", "-an", "-sn", "-dn"]
+    cmd += ["-map", "0:V:0", "-c:v", "copy", "-map_metadata", "0", "-an", "-sn", "-dn"]
     if out.suffix.lower() in (".mp4", ".mov"):
         cmd += ["-movflags", "+faststart"]
     cmd += ["-progress", "pipe:1", "-nostats", str(out)]
@@ -273,9 +434,14 @@ def build_audio_extract_cmd(
     out = output or make_output_with_suffix(src, "", fmt)
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin", "-i", str(src)]
     cmd += ["-vn", "-map", "0:a:0"]
+    first = media.audio[0] if media.audio else None
+    copying = fmt != "mp3" and bool(first and first.codec == "aac")
+    # 声道布局 unknown 的 5.1 会被 AAC 编码器以 "6 channels" 拒绝，抽出来是 0 字节
+    if not copying and first is not None and first.layout_unknown:
+        cmd += ["-af", "aformat=channel_layouts=mono|stereo|5.1|7.1"]
     if fmt == "mp3":
         cmd += ["-c:a", "libmp3lame", "-b:a", "192k"]
     else:
-        cmd += ["-c:a", "copy" if (media.audio and media.audio[0].codec == "aac") else "aac"]
+        cmd += ["-c:a", "copy" if copying else "aac"]
     cmd += ["-progress", "pipe:1", "-nostats", str(out)]
     return cmd

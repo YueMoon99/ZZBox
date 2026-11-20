@@ -625,7 +625,7 @@ def build_plan(
             label="拆帧",
             cmd=[
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
-                "-i", str(src), "-map", "0:v:0",
+                "-i", str(src), "-map", "0:V:0",
                 "-fps_mode", "passthrough",
                 "-vf", yuv2rgb,
                 "-pix_fmt", "rgb24",
@@ -759,7 +759,7 @@ def build_plan(
         "-framerate", f"{plan.fps:.6f}", "-start_number", "1",
         "-i", str(cur_input / "%06d.png"),
         "-i", str(src),
-        "-map", "0:v:0",
+        "-map", "0:V:0",
     ]  # fmt: skip
     if audio_args:
         mux += ["-map", "1:a?"]

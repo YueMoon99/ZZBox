@@ -102,6 +102,7 @@ class ExportDialog(QDialog):
         mode: str = "video",
         default_name: str = "",
         initial_dir: str = "",
+        formats: list[tuple[str, str]] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -140,7 +141,9 @@ class ExportDialog(QDialog):
         # ---- 保存类型 ----
         lay.addWidget(self._label("保存类型"))
         self.fmt_box = QComboBox()
-        for key, label in EXPORT_FORMATS.get(mode, EXPORT_FORMATS["video"]):
+        # 容器列表可以按编码器裁剪：AV1 在 MOV 里根本封装不了（ffmpeg 直接报
+        # "av1 only supported in MP4 and AVIF"），列出来就是给用户挖坑。
+        for key, label in formats or EXPORT_FORMATS.get(mode, EXPORT_FORMATS["video"]):
             self.fmt_box.addItem(label, key)
         saved = self._last_fmt.get(mode)
         if saved:
@@ -271,6 +274,7 @@ class ExportDialog(QDialog):
         mode: str = "video",
         default_name: str = "",
         initial_dir: str = "",
+        formats: list[tuple[str, str]] | None = None,
     ) -> ExportChoice | None:
         dlg = cls(
             parent,
@@ -278,6 +282,7 @@ class ExportDialog(QDialog):
             mode=mode,
             default_name=default_name,
             initial_dir=initial_dir,
+            formats=formats,
         )
         if dlg.exec() == QDialog.Accepted:
             return dlg.chosen()

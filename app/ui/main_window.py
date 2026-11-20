@@ -60,6 +60,7 @@ from app.core.ai import (
 from app.core.ai import estimate_output_bytes as estimate_ai_bytes
 from app.core.ai_runner import AiRunner
 from app.core.encoder import (
+    EncCaps,
     EncodeSettings,
     build_audio_extract_cmd,
     build_command,
@@ -101,7 +102,7 @@ from app.core.pdf_images import PageStat, estimate_pdf, merge_pdf, stage_page
 from app.core.probe import EnvInfo, probe_environment, _find_tool
 from app.core.runner import EncodeRunner
 from app.ui import icons, style
-from app.ui.export_dialog import ExportChoice, ExportDialog
+from app.ui.export_dialog import EXPORT_FORMATS, ExportChoice, ExportDialog
 from app.ui.page_grid import PageGrid
 from app.ui.tray import Tray
 from app.ui.widgets import (
@@ -532,6 +533,33 @@ class MainWindow(QMainWindow):
         "批量压缩 · 格式转换 · AI 超分放大",
         "拖入 PDF 或图片，按页排序后导出",
     )
+    _HDR_NOTE = "HDR 素材将转为 SDR"
+
+    def _hdr_notice(self) -> str:
+        """当前编码器吃不了 10bit 时，队列里只要有 HDR 素材就先说清会转 SDR。"""
+        chips = getattr(self, "enc_chips", None)
+        cache = getattr(self, "media_cache", None)
+        if getattr(self, "_page", 0) != 0 or chips is None or not cache:
+            return ""
+        # 读控件而不是 self.settings：后者只在按「开始压制」时才刷新
+        enc = chips.value() or "hevc"
+        if self.env is not None:
+            item = self.env.encoder(enc)
+            if item is None or item.bit10:
+                return ""
+        elif enc != "h264":
+            # 环境还没探完：按老规矩只对 H.264 提示，别对着 HEVC 报假警
+            return ""
+        for info in cache.values():
+            if info.ok and info.is_hdr and info.bit_depth > 8:
+                return self._HDR_NOTE
+        return ""
+
+    def _refresh_mode_hint(self) -> None:
+        page = getattr(self, "_page", 0)
+        base = self._MODE_HINTS[page] if page < 3 else ""
+        note = self._hdr_notice()
+        self.mode_hint.setText(f"{base} · {note}" if base and note else (base or note))
 
     def _set_mode(self, mode: int) -> None:
         """切工作台。三个队列各自记状态，互不影响。"""
@@ -540,7 +568,7 @@ class MainWindow(QMainWindow):
         self.btn_mode_image.setChecked(mode == 1)
         self.btn_mode_pdf.setChecked(mode == 2)
         self.pages.setCurrentIndex(mode)
-        self.mode_hint.setText(self._MODE_HINTS[mode] if mode < 3 else "")
+        self._refresh_mode_hint()
         self.btn_extract.setVisible(mode == 0)
         self.btn_strip.setVisible(mode == 0)
         self._update_start_text()
@@ -563,7 +591,7 @@ class MainWindow(QMainWindow):
         i18n.literal(self.btn_lang, i18n.switch_label())
         i18n.literal(self.btn_lang, i18n.switch_tip(), "setToolTip")
         self.setWindowTitle(f"{APP_TITLE} {APP_VERSION}")
-        self.mode_hint.setText(self._MODE_HINTS[self._page] if self._page < 3 else "")
+        self._refresh_mode_hint()
         self._update_start_text()
         self._refresh_count()
         self._img_refresh_count()
@@ -2997,6 +3025,7 @@ class MainWindow(QMainWindow):
         for path in self.files:
             self._paint_row(path, s)
         self._refresh_scale_preview()
+        self._refresh_mode_hint()
 
     def _rebuild_list(self) -> None:
         """把 files/states 重新铺成表格。
@@ -3067,6 +3096,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def _refresh_count(self) -> None:
+        self._refresh_mode_hint()
         n = len(self.files)
         self._sync_tray()
         if not n:
@@ -3293,12 +3323,16 @@ class MainWindow(QMainWindow):
         if not m or not m.ok:
             self.compress_panel.note.setText("选择文件后显示输出规格")
             return
-        s = EncodeSettings(**self._scale_params())
+        s = EncodeSettings(
+            encoder=self.enc_chips.value() or "hevc", **self._scale_params()
+        )
         w, h = compute_target(m, s)
         if w and h:
-            ratio = w / m.width * 100 if m.width else 100
+            # 跟「显示尺寸」比：竖拍视频存储的是横的，转正之后才是用户看到的方向
+            sw, sh = m.display_width, m.display_height
+            ratio = w / sw * 100 if sw else 100
             pct = "" if abs(ratio - 100) < 0.5 else f"，{ratio:.0f}%"
-            head = f"输出 {w}×{h}（源 {m.width}×{m.height}{pct}）"
+            head = f"输出 {w}×{h}（源 {sw}×{sh}{pct}）"
         else:
             head = "输出 原尺寸"
         self.compress_panel.note.setText(f"{head} · {m.audio_summary}")
@@ -3516,12 +3550,19 @@ class MainWindow(QMainWindow):
             elif mode == "pdf" and self.pdf_items:
                 init = str(Path(self.pdf_items[0].ref.src).parent)
         titles = {"video": "导出视频", "image": "导出图片", "pdf": "导出 PDF"}
+        formats = None
+        if mode == "video":
+            # AV1 封不进 MOV（ffmpeg: "av1 only supported in MP4 and AVIF"），
+            # 与其等它压完再报错，不如干脆不提供这个选项。
+            if self._collect().encoder == "av1":
+                formats = [f for f in EXPORT_FORMATS["video"] if f[0] != "mov"]
         choice = ExportDialog.get_choice(
             self,
             title=titles.get(mode, "导出"),
             mode=mode,
             default_name=default_name,
             initial_dir=init,
+            formats=formats,
         )
         if choice is None:
             return None
@@ -3686,6 +3727,11 @@ class MainWindow(QMainWindow):
             )
             return
         if not self.env or not self.env.ffmpeg:
+            # 探测要拉起十几个 ffmpeg 子进程，头一两秒点「开始压制」是没反应的。
+            # 与其让用户以为程序卡死，不如直接说清楚。
+            QMessageBox.information(
+                self, "正在检测显卡", "还在确认显卡和 ffmpeg，稍等一两秒再开始。"
+            )
             return
         pending = [
             p for p in self.files
@@ -3767,9 +3813,34 @@ class MainWindow(QMainWindow):
 
         out = make_output_path(path, self.settings, self.settings.encoder)
         out = self._named_output(out)
-        res = build_command(info, self.settings, self.env.ffmpeg, out)
+        res = build_command(
+            info,
+            self.settings,
+            self.env.ffmpeg,
+            out,
+            caps=self._caps(self.settings.encoder),
+        )
+        if res.warnings:
+            # 「HDR 转 SDR」这类降级必须让用户看得见，只写日志等于没说。
+            # 存进 extra：成功分支会把 tip 清空，不留一份就被抹掉了。
+            note = "；".join(res.warnings)
+            st.extra["note"] = note
+            st.tip = note
+            self._repaint_row(path)
         self._set_progress(0)
         self.runner.start(res.cmd, info.duration)
+
+    def _caps(self, key: str) -> EncCaps:
+        """当前显卡的能力。环境探测还没回来时按「全支持」处理，不挡启动。"""
+        e = self.env.encoder(key) if self.env else None
+        if e is None:
+            return EncCaps(tonemap=self.env.tonemap if self.env else True)
+        return EncCaps(
+            bit10=e.bit10,
+            bframes=e.bframes,
+            tonemap=self.env.tonemap,
+            advanced=e.advanced,
+        )
 
     def _on_progress(self, pct: int, speed: float, remaining: str) -> None:
         if self._mode != "encode":
@@ -3807,7 +3878,8 @@ class MainWindow(QMainWindow):
             elif ok:
                 st.phase = "done"
                 st.status = "已完成压制"
-                st.tip = ""
+                # 压制过程中记下的降级说明（HDR→SDR）在这里接力显示
+                st.tip = st.extra.pop("note", "")
                 self._ok += 1
             else:
                 st.phase = "failed"
