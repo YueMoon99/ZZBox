@@ -14,15 +14,20 @@
 PDF 一格一页地重排、合并、拆页，压缩只换图片不动文字。
 
 ![Release](https://img.shields.io/badge/release-v0.7.0-2f6fed)
-
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078d4)
-
 ![Python](https://img.shields.io/badge/python-3.13-3776ab)
-
 ![License](https://img.shields.io/badge/license-MIT-3da639)
 
 </div>
 <img width="1120" height="760" alt="image" src="https://github.com/user-attachments/assets/ce431757-d54d-48d0-8542-361494a5d123" />
+
+## 💬 联系作者<br>
+由 舟午YueMoon 开发。<br>
+如果你有任何建议、遇到了 BUG，或者单纯想催更，欢迎在B站/Youtube相关视频的评论区告诉我！<br>
+博客：http://yuemoon.vip/<br>
+GitHub：@YueMoon99<br>
+B站：UID223633562<br>
+YouTube：@YueMoon99<br>
 
 
 |          视频处理         |        图片处理       |    PDF 处理    |
@@ -543,15 +548,6 @@ PDF 部分刻意没有用 PyMuPDF（AGPL，会把整个项目的授权传染掉�
 
 ---
 
-## 💬 联系作者
-由 舟午YueMoon 开发。
-如果你有任何建议、遇到了 BUG，或者单纯想催更，欢迎在B站/Youtube相关视频的评论区告诉我！
-博客：http://yuemoon.vip/
-GitHub：@YueMoon99
-B站：UID223633562
-YouTube：@YueMoon99
-
----
 <a id="english"></a>
 
 <sub><a href="#zh">简体中文</a> · <b>English</b></sub>
@@ -575,6 +571,13 @@ PDF pages get reordered one cell at a time, merged, split — and compression sw
 
 </div>
 <img width="1121" height="791" alt="image" src="https://github.com/user-attachments/assets/c32d1948-3856-425c-b79c-82580a4c6095" />
+
+
+## 💬 Contact<br>
+Blog：http://yuemoon.vip/<br>
+GitHub：@YueMoon99<br>
+Blibili：UID223633562<br>
+YouTube：@YueMoon99<br>
 
 
 |        Video        |       Images        |      PDF      |
@@ -1092,12 +1095,5 @@ If you redistribute: keep the `licenses/` folder and stay able to supply the mat
 - [ncnn](https://github.com/Tencent/ncnn) — the inference framework behind both; the Vulkan backend is what keeps this tool free of a CUDA install
 
 ---
-
-## 💬 Contact
-Blog：http://yuemoon.vip/
-GitHub：@YueMoon99
-Blibili：UID223633562
-YouTube：@YueMoon99
-
 <sub><a href="#zh">↑ 返回中文 / Back to Chinese</a></sub>
 
